@@ -1,0 +1,48 @@
+# ============================================================
+# Feedback Loop Configuration
+# ============================================================
+
+# --- Stable Diffusion model -------------------------------------------
+# HuggingFace model ID or absolute path to a local SD 1.x checkpoint.
+# Examples:
+#   "runwayml/stable-diffusion-v1-5"
+#   "stabilityai/stable-diffusion-2-1"
+#   "/path/to/local/sd-model"
+sd_model_id: "runwayml/stable-diffusion-v1-5"
+
+# --- Classifiers (same names as evaluate.py) --------------------------
+models_dir: ../../models/.models
+
+classifiers:
+  - resnet50
+  - densenet121
+  - vit_b_16
+  - densenet121_dct
+
+dct_log_scale: true
+
+# --- Generation settings ----------------------------------------------
+# Prompts are rotated across iterations.
+prompts:
+  - "a photo of a person"
+  - "a realistic portrait photograph"
+  - "a photorealistic human face, studio lighting"
+
+image_height: 512
+image_width:  512
+batch_size: 1                   # increase if VRAM allows
+num_inference_steps: 20         # DDIM steps; 20 is fast, 50 is higher quality
+guidance_scale: 7.5
+
+# --- Training ---------------------------------------------------------
+total_iterations: 500           # total feedback steps
+learning_rate: 1.0e-6           # keep small to avoid destroying generative quality
+grad_clip: 1.0                  # gradient norm clipping
+
+# --- Checkpointing & output -------------------------------------------
+output_dir: feedback_output
+save_every: 50                  # save UNet checkpoint every N steps
+save_images_every: 25           # save sample decoded images every N steps
+
+# --- Device -----------------------------------------------------------
+device: auto                    # "auto" = CUDA if available, else CPU
