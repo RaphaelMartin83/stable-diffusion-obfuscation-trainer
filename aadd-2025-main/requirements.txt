@@ -1,4 +1,24 @@
-# Esempio, modifica in base al tuo classificatore
-numpy
-tensorflow  # o pytorch, se lo usi
-opencv-python
+# ==============================================================
+# requirements.txt — full environment, real feedback loop (CUDA)
+# ==============================================================
+#
+# Use this on a CUDA-capable machine.
+# torch from PyPI bundles CUDA support automatically when CUDA
+# drivers are present — no extra index URL needed.
+#
+# Create venv and install:
+#
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# For CPU / mock mode only, use requirements_mock.txt instead.
+# ==============================================================
+
+# Core deps (shared with mock mode)
+-r requirements_mock.txt
+
+# Stable Diffusion pipeline (real feedback_loop.py)
+diffusers>=0.27.0
+transformers>=4.38.0
+accelerate>=0.28.0
