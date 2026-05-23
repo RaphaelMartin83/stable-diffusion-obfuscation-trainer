@@ -1,0 +1,43 @@
+# ============================================================
+# Mock Feedback Loop Configuration
+# No real model downloads. No GPU. No .pth files needed.
+# ============================================================
+
+# Ignored by mock (no download happens), but kept for config parity
+sd_model_id: "mock"
+
+# Classifiers: mock uses random-weight tiny CNNs, names are still validated
+classifiers:
+  - resnet50
+  - densenet121
+  - vit_b_16
+  - densenet121_dct
+
+dct_log_scale: true
+
+# models_dir is unused in mock mode (no .pth loading), kept for parity
+models_dir: ../../models/.models
+
+# --- Generation settings (small = fast on CPU) ------------------------
+prompts:
+  - "a photo of a person"
+  - "a realistic portrait photograph"
+  - "a photorealistic human face"
+
+image_height: 64          # 64 → 8×8 latent → 16×16 decoded pixels
+image_width:  64
+batch_size: 1
+num_inference_steps: 3    # 3 DDIM steps is enough to test the loop
+guidance_scale: 7.5
+
+# --- Training ---------------------------------------------------------
+total_iterations: 10
+learning_rate: 1.0e-4     # higher OK for tiny mock model
+grad_clip: 1.0
+
+# --- Output -----------------------------------------------------------
+output_dir: mock_output
+save_every: 5             # checkpoint at step 5 and 10
+save_images_every: 3      # images at step 3, 6, 9
+
+device: cpu               # forced to CPU regardless in mock mode
