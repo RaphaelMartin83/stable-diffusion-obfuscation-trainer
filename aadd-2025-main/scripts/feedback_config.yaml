@@ -13,11 +13,21 @@ sd_model_id: "runwayml/stable-diffusion-v1-5"
 # --- Classifiers (same names as evaluate.py) --------------------------
 models_dir: ../../models/.models
 
+# classifiers are used as the adversarial training signal (gradient flows through these)
 classifiers:
+  - resnet50
+  - densenet121
+
+# evaluator models are used only for measurement — no gradient, just counting detections
+# defaults to 'classifiers' if omitted
+evaluator:
   - resnet50
   - densenet121
   - vit_b_16
   - densenet121_dct
+
+# number of images generated for each evaluation pass (pre- and post-training)
+eval_iterations: 100
 
 dct_log_scale: true
 

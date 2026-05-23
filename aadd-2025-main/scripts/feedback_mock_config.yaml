@@ -6,12 +6,21 @@
 # Ignored by mock (no download happens), but kept for config parity
 sd_model_id: "mock"
 
-# Classifiers: mock uses random-weight tiny CNNs, names are still validated
+# classifiers: used as training signal (gradient flows through these)
 classifiers:
+  - resnet50
+  - densenet121
+
+# evaluator: used only for detection measurement (no gradient)
+# defaults to 'classifiers' if omitted
+evaluator:
   - resnet50
   - densenet121
   - vit_b_16
   - densenet121_dct
+
+# images generated per evaluation pass
+eval_iterations: 5
 
 dct_log_scale: true
 

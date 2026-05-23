@@ -300,6 +300,174 @@ def classifier_evasion_loss(
 
 
 # ---------------------------------------------------------------------------
+# Pure-inference generation (evaluation only — no grad)
+# ---------------------------------------------------------------------------
+
+def generate_latents_inference(
+    unet,
+    scheduler,
+    text_embeddings: torch.Tensor,
+    latent_shape: tuple,
+    num_inference_steps: int,
+    guidance_scale: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Full DDIM pass under no_grad — used by the evaluator, never by the trainer."""
+    scheduler.set_timesteps(num_inference_steps)
+    latents = torch.randn(latent_shape, device=device) * scheduler.init_noise_sigma
+    for t in scheduler.timesteps:
+        latent_input = torch.cat([latents] * 2)
+        latent_input = scheduler.scale_model_input(latent_input, t)
+        noise_pred = unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+    return latents
+
+
+# ---------------------------------------------------------------------------
+# Evaluator: measure fake-detection rate over N generated images
+# ---------------------------------------------------------------------------
+
+def evaluate_detection(
+    unet: nn.Module,
+    vae: nn.Module,
+    scheduler,
+    text_encoder: nn.Module,
+    tokenizer,
+    evaluators: dict,
+    cfg: dict,
+    device: torch.device,
+    n_iters: int,
+    log_scale: bool,
+    label: str = "",
+) -> dict:
+    """
+    Generate n_iters images with the current UNet and count how many each
+    evaluator classifies as fake (class 1) vs. real (class 0).
+    Returns per-evaluator stats and an aggregate.
+    """
+    unet.eval()
+    prompts: list[str] = cfg.get("prompts", ["a photo of a person"])
+    batch_size: int = int(cfg.get("batch_size", 1))
+    num_steps: int = int(cfg.get("num_inference_steps", 20))
+    guidance: float = float(cfg.get("guidance_scale", 7.5))
+    latent_h = int(cfg.get("image_height", 512)) // 8
+    latent_w = int(cfg.get("image_width", 512)) // 8
+    latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
+
+    tag = f" [{label}]" if label else ""
+    print(f"\n[EVAL{tag}] Generating {n_iters} images...")
+    counts: dict[str, dict] = {n: {"fake": 0, "real": 0} for n in evaluators}
+
+    with torch.no_grad():
+        uncond_ids = tokenizer(
+            [""] * batch_size, padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True, return_tensors="pt",
+        ).input_ids.to(device)
+        uncond_emb = text_encoder(uncond_ids)[0]
+
+        for i in trange(n_iters, desc=f"Eval{tag}"):
+            prompt = prompts[i % len(prompts)]
+            cond_ids = tokenizer(
+                [prompt] * batch_size, padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True, return_tensors="pt",
+            ).input_ids.to(device)
+            text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
+
+            latents = generate_latents_inference(
+                unet, scheduler, text_embeddings,
+                latent_shape, num_steps, guidance, device,
+            )
+            pixel_01 = (vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1) + 1) / 2
+            pil_imgs = latent_to_pil(vae, latents)
+
+            for name, clf in evaluators.items():
+                if name.endswith("_dct"):
+                    tensors = torch.cat(
+                        [apply_classifier_transform(img, name, log_scale, device) for img in pil_imgs],
+                        dim=0,
+                    )
+                    logits = clf(tensors)
+                else:
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    size = (224, 224) if name == "vit_b_16" else (256, 256)
+                    logits = clf((F.interpolate(pixel_01, size=size, mode="bilinear", align_corners=False) - mean) / std)
+                for pred in logits.argmax(1):
+                    counts[name]["real" if pred.item() == CLASS_IDX_REAL else "fake"] += 1
+
+    unet.train()
+
+    results: dict = {}
+    for name, c in counts.items():
+        total = c["fake"] + c["real"]
+        results[name] = {
+            "detected_fake": c["fake"],
+            "detected_real": c["real"],
+            "total": total,
+            "fake_detection_rate": c["fake"] / total if total > 0 else 0.0,
+            "evasion_rate":        c["real"] / total if total > 0 else 0.0,
+        }
+    agg_fake  = sum(v["detected_fake"] for v in results.values())
+    agg_total = sum(v["total"]         for v in results.values())
+    results["_aggregate"] = {
+        "fake_detection_rate": agg_fake / agg_total if agg_total > 0 else 0.0,
+        "evasion_rate":        1.0 - (agg_fake / agg_total) if agg_total > 0 else 0.0,
+    }
+    return results
+
+
+def print_eval_report(results: dict, label: str):
+    W = 64
+    print(f"\n{'═'*W}")
+    print(f"  Evaluation Report — {label}")
+    print(f"{'═'*W}")
+    for name, s in results.items():
+        if name == "_aggregate":
+            continue
+        filled = round(s["fake_detection_rate"] * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        print(f"  {name:<17}  detected fake: {s['detected_fake']:>4}/{s['total']:<4}"
+              f"  [{bar}] {s['fake_detection_rate']:>6.1%}")
+    agg = results["_aggregate"]
+    print(f"  {'─'*60}")
+    filled = round(agg["fake_detection_rate"] * 20)
+    bar = "█" * filled + "░" * (20 - filled)
+    print(f"  {'AGGREGATE':<17}  detection rate:        [{bar}] {agg['fake_detection_rate']:>6.1%}")
+    print(f"  {'':17}  evasion  rate:         {'':22}{agg['evasion_rate']:>6.1%}")
+    print(f"{'═'*W}\n")
+
+
+def print_comparison(pre: dict, post: dict):
+    W = 64
+    pre_agg  = pre["_aggregate"]["fake_detection_rate"]
+    post_agg = post["_aggregate"]["fake_detection_rate"]
+    delta    = post_agg - pre_agg
+    arrow    = "▼" if delta < 0 else ("▲" if delta > 0 else "─")
+    print(f"\n{'═'*W}")
+    print(f"  Training Effect Summary")
+    print(f"{'═'*W}")
+    print(f"  {'Evaluator':<17}  {'Before':>8}   {'After':>8}   {'Δ':>7}")
+    print(f"  {'─'*60}")
+    for name in (n for n in pre if n != "_aggregate"):
+        p = pre[name]["fake_detection_rate"]
+        q = post[name]["fake_detection_rate"]
+        d = q - p
+        sym = "▼" if d < 0 else ("▲" if d > 0 else "─")
+        print(f"  {name:<17}  {p:>8.1%}   {q:>8.1%}   {sym}{abs(d):>5.1%}")
+    print(f"  {'─'*60}")
+    print(f"  {'AGGREGATE':<17}  {pre_agg:>8.1%}   {post_agg:>8.1%}   {arrow}{abs(delta):>5.1%}")
+    direction = "decreased" if delta < 0 else "increased"
+    print(f"\n  Fake detection {direction} by {abs(delta):.1%} after training.")
+    print(f"  Evasion rate: {pre['_aggregate']['evasion_rate']:.1%} "
+          f"→ {post['_aggregate']['evasion_rate']:.1%}")
+    print(f"{'═'*W}\n")
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -318,167 +486,163 @@ def run_feedback_loop(cfg: dict):
     pipe = StableDiffusionPipeline.from_pretrained(
         sd_model_id,
         torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
-        safety_checker=None,  # disabled — we are doing research
+        safety_checker=None,
     )
-    # Replace scheduler with DDIM for deterministic stepping
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe = pipe.to(device)
 
-    unet = pipe.unet
-    vae = pipe.vae
+    unet         = pipe.unet
+    vae          = pipe.vae
     text_encoder = pipe.text_encoder
-    tokenizer = pipe.tokenizer
+    tokenizer    = pipe.tokenizer
 
-    # Freeze VAE and text encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-
-    # UNet is trainable
     unet.train()
     unet.requires_grad_(True)
-
     print(f"[SD] UNet parameters: {sum(p.numel() for p in unet.parameters()):,}")
 
-    # --- Load classifiers ---------------------------------------------------
     models_dir = Path(cfg["models_dir"])
-    log_scale = bool(cfg.get("dct_log_scale", True))
+    log_scale  = bool(cfg.get("dct_log_scale", True))
+
+    # --- Load classifiers (adversarial training signal) --------------------
     classifiers: dict[str, nn.Module] = {}
     for clf_name in cfg["classifiers"]:
         w_path = models_dir / f"{clf_name}.pth"
         if not w_path.exists():
             raise FileNotFoundError(f"Classifier weights not found: {w_path}")
         classifiers[clf_name] = load_classifier(clf_name, w_path, device)
-        print(f"[CLF] Loaded '{clf_name}' (frozen)")
+        print(f"[CLF]  Loaded '{clf_name}' (frozen — training signal)")
 
-    # --- Optimizer ----------------------------------------------------------
-    lr = float(cfg.get("learning_rate", 1e-6))
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
-    grad_clip = float(cfg.get("grad_clip", 1.0))
+    # --- Load evaluators (measurement only, no gradient) ------------------
+    evaluator_names: list[str] = cfg.get("evaluator", cfg["classifiers"])
+    evaluators: dict[str, nn.Module] = {}
+    for ev_name in evaluator_names:
+        w_path = models_dir / f"{ev_name}.pth"
+        if not w_path.exists():
+            raise FileNotFoundError(f"Evaluator weights not found: {w_path}")
+        evaluators[ev_name] = load_classifier(ev_name, w_path, device)
+        print(f"[EVAL] Loaded '{ev_name}' (frozen — measurement only)")
 
-    # --- Generation settings ------------------------------------------------
-    prompts: list[str] = cfg.get("prompts", ["a photo of a person"])
-    batch_size: int = int(cfg.get("batch_size", 1))
-    num_steps: int = int(cfg.get("num_inference_steps", 20))
-    guidance: float = float(cfg.get("guidance_scale", 7.5))
-    total_iterations: int = int(cfg.get("total_iterations", 500))
-    save_every: int = int(cfg.get("save_every", 50))
-    output_dir = Path(cfg.get("output_dir", "feedback_output"))
+    # --- Settings -----------------------------------------------------------
+    prompts: list[str]   = cfg.get("prompts", ["a photo of a person"])
+    batch_size: int      = int(cfg.get("batch_size", 1))
+    num_steps: int       = int(cfg.get("num_inference_steps", 20))
+    guidance: float      = float(cfg.get("guidance_scale", 7.5))
+    total_iterations     = int(cfg.get("total_iterations", 500))
+    eval_iterations      = int(cfg.get("eval_iterations", 100))
+    save_every           = int(cfg.get("save_every", 50))
+    save_images_every    = int(cfg.get("save_images_every", 25))
+    lr                   = float(cfg.get("learning_rate", 1e-6))
+    grad_clip            = float(cfg.get("grad_clip", 1.0))
+    output_dir           = Path(cfg.get("output_dir", "feedback_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_images_every: int = int(cfg.get("save_images_every", 25))
 
-    # Pre-compute text embeddings (CFG: unconditional + conditional)
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 1 — Pre-training evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    pre_results = evaluate_detection(
+        unet, vae, pipe.scheduler, text_encoder, tokenizer,
+        evaluators, cfg, device, eval_iterations, log_scale,
+        label="PRE-TRAINING",
+    )
+    print_eval_report(pre_results, "Pre-Training")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 2 — Training
+    # ═══════════════════════════════════════════════════════════════════════
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
+
     with torch.no_grad():
-        # Unconditional embedding
         uncond_ids = tokenizer(
-            [""] * batch_size,
-            padding="max_length",
+            [""] * batch_size, padding="max_length",
             max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
+            truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         uncond_emb = text_encoder(uncond_ids)[0]
-
-        # Conditional embeddings (cycle through prompts)
         cond_ids = tokenizer(
-            [prompts[0]] * batch_size,
-            padding="max_length",
+            [prompts[0]] * batch_size, padding="max_length",
             max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
+            truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         cond_emb = text_encoder(cond_ids)[0]
+    text_embeddings = torch.cat([uncond_emb, cond_emb])
 
-    text_embeddings = torch.cat([uncond_emb, cond_emb])  # 2B × 77 × 768
-
-    # Latent shape: SD uses 4-channel latents at 1/8 spatial resolution
-    latent_h = int(cfg.get("image_height", 512)) // 8
-    latent_w = int(cfg.get("image_width", 512)) // 8
+    latent_h     = int(cfg.get("image_height", 512)) // 8
+    latent_w     = int(cfg.get("image_width",  512)) // 8
     latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
 
-    # --- Training -----------------------------------------------------------
     history = []
     print(f"\n[LOOP] Starting feedback loop for {total_iterations} iterations\n")
 
     for step in trange(1, total_iterations + 1, desc="Feedback loop"):
-        # Rotate prompt every iteration
         prompt = prompts[(step - 1) % len(prompts)]
         if step > 1 and (step - 1) % len(prompts) == 0:
-            # Refresh conditional embedding when prompt rotates
             with torch.no_grad():
                 cond_ids = tokenizer(
-                    [prompt] * batch_size,
-                    padding="max_length",
+                    [prompt] * batch_size, padding="max_length",
                     max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt",
+                    truncation=True, return_tensors="pt",
                 ).input_ids.to(device)
                 cond_emb = text_encoder(cond_ids)[0]
             text_embeddings = torch.cat([uncond_emb, cond_emb])
 
         optimizer.zero_grad()
 
-        # 1. Generate latents (differentiable through final UNet step)
         latents = generate_latents_differentiable(
-            unet=unet,
-            scheduler=pipe.scheduler,
-            text_embeddings=text_embeddings,
-            latent_shape=latent_shape,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance,
-            device=device,
+            unet=unet, scheduler=pipe.scheduler,
+            text_embeddings=text_embeddings, latent_shape=latent_shape,
+            num_inference_steps=num_steps, guidance_scale=guidance, device=device,
         )
-
-        # 2. Compute evasion loss
         loss, clf_info = classifier_evasion_loss(
-            vae=vae,
-            latents=latents,
-            classifiers=classifiers,
-            log_scale=log_scale,
-            device=device,
+            vae=vae, latents=latents, classifiers=classifiers,
+            log_scale=log_scale, device=device,
         )
-
-        # 3. Backprop + update UNet
         loss.backward()
         torch.nn.utils.clip_grad_norm_(unet.parameters(), grad_clip)
         optimizer.step()
 
-        # 4. Logging
-        log_entry = {
-            "step": step,
-            "loss": loss.item(),
-            "prompt": prompt,
-            "classifiers": clf_info,
-        }
-        history.append(log_entry)
+        history.append({"step": step, "loss": loss.item(), "prompt": prompt, "classifiers": clf_info})
+        asr_summary = "  ".join(f"{n}={v['attack_success_rate']:.2f}" for n, v in clf_info.items())
+        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}")
 
-        asr_summary = "  ".join(
-            f"{n}={v['attack_success_rate']:.2f}" for n, v in clf_info.items()
-        )
-        trange_msg = f"loss={loss.item():.4f}  {asr_summary}"
-        print(f"\n[Step {step:04d}] {trange_msg}")
-
-        # 5. Save sample images periodically
         if step % save_images_every == 0:
             pil_imgs = latent_to_pil(vae, latents.detach())
             for i, img in enumerate(pil_imgs):
                 img.save(output_dir / f"step{step:04d}_img{i}.png")
             print(f"    Saved {len(pil_imgs)} sample image(s) to {output_dir}/")
 
-        # 6. Save UNet checkpoint periodically
         if step % save_every == 0:
             ckpt_path = output_dir / f"unet_step{step:04d}.pth"
             torch.save(unet.state_dict(), ckpt_path)
             print(f"    Checkpoint saved: {ckpt_path}")
 
-        # 7. Save JSON history
-        json_path = output_dir / "training_history.json"
-        with open(json_path, "w") as f:
+        with open(output_dir / "training_history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    print(f"\n[DONE] Final checkpoint and history saved to {output_dir}/")
     final_ckpt = output_dir / "unet_final.pth"
     torch.save(unet.state_dict(), final_ckpt)
-    print(f"[DONE] Final UNet weights: {final_ckpt}")
+    print(f"\n[DONE] Final UNet weights: {final_ckpt}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 3 — Post-training evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    post_results = evaluate_detection(
+        unet, vae, pipe.scheduler, text_encoder, tokenizer,
+        evaluators, cfg, device, eval_iterations, log_scale,
+        label="POST-TRAINING",
+    )
+    print_eval_report(post_results, "Post-Training")
+    print_comparison(pre_results, post_results)
+
+    report = {
+        "pre_training":      pre_results,
+        "post_training":     post_results,
+        "training_history":  history,
+    }
+    with open(output_dir / "training_history.json", "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"[DONE] Full report saved to {output_dir}/training_history.json")
 
 
 # ---------------------------------------------------------------------------

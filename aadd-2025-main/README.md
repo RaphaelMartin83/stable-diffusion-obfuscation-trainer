@@ -193,7 +193,48 @@ Output printed to stdout and optionally saved as JSON (`save_json` key in config
 
 ## 🔁 Feedback Loop — Fine-tune SD to Evade Classifiers
 
-The feedback loop generates images with Stable Diffusion and backpropagates the classifier evasion signal into the UNet weights. After training, the fine-tuned UNet produces images the classifiers label as "real".
+The feedback loop runs in **three phases**:
+
+```
+PHASE 1 — Pre-training evaluation
+  Generate eval_iterations images → run each through the evaluators
+  → print per-model fake detection rate
+
+PHASE 2 — Training
+  Generate images → backpropagate classifier evasion loss → update UNet weights
+  (only the classifiers listed under 'classifiers' drive the gradient)
+
+PHASE 3 — Post-training evaluation
+  Same as Phase 1 → compare Before / After detection rates per evaluator
+```
+
+The distinction between `classifiers` and `evaluator` in the config is intentional:
+
+| Config key | Role |
+|---|---|
+| `classifiers` | Provide the **gradient signal** during training. Use the models whose loss is differentiable (spatial: ResNet, DenseNet, ViT). |
+| `evaluator` | **Measure** detection rate only — no gradient. Can include all models, including DCT-based ones. Defaults to `classifiers` if omitted. |
+| `eval_iterations` | Number of images generated per evaluation pass (default `100`). |
+
+At the end of a run, the terminal prints a summary like:
+
+```
+════════════════════════════════════════════════════════════════
+  Training Effect Summary
+════════════════════════════════════════════════════════════════
+  Evaluator            Before      After         Δ
+  ────────────────────────────────────────────────────────────
+  resnet50              80.0%      60.0%   ▼20.0%
+  densenet121          100.0%      80.0%   ▼20.0%
+  vit_b_16              40.0%      40.0%   ─ 0.0%
+  densenet121_dct        0.0%       0.0%   ─ 0.0%
+  ────────────────────────────────────────────────────────────
+  AGGREGATE             55.0%      45.0%   ▼10.0%
+
+  Fake detection decreased by 10.0% after training.
+  Evasion rate: 45.0% → 55.0%
+════════════════════════════════════════════════════════════════
+```
 
 ### Mock mode (CPU — verifies the full pipeline without any downloads)
 
@@ -204,25 +245,36 @@ cd scripts
 python3 feedback_loop_mock.py --config feedback_mock_config.yaml
 ```
 
-All 10 iterations complete in ~1 second. Outputs go to `scripts/mock_output/`:
-- `step000X_imgY.png` — decoded sample images
-- `unet_mock_stepXXXX.pth` — UNet checkpoints
-- `mock_training_history.json` — per-step loss and attack success rate
+Completes in ~1 second. Outputs go to `scripts/mock_output/`:
+
+| File | Description |
+|------|-------------|
+| `step000X_imgY.png` | Decoded sample images saved every `save_images_every` steps |
+| `unet_mock_stepXXXX.pth` | UNet checkpoints saved every `save_every` steps |
+| `mock_training_history.json` | Pre/post evaluation results + per-step training loss |
 
 ### Real mode (CUDA — trains actual Stable Diffusion)
 
 **1. Edit `scripts/feedback_config.yaml`:**
 
 ```yaml
-# HuggingFace model ID or path to a local SD 1.x / 2.x checkpoint
 sd_model_id: "runwayml/stable-diffusion-v1-5"
 
 models_dir: ../../models/.models
+
+# Training signal — gradient flows through these classifiers
 classifiers:
+  - resnet50
+  - densenet121
+
+# Measurement only — all models evaluated before and after training
+evaluator:
   - resnet50
   - densenet121
   - vit_b_16
   - densenet121_dct
+
+eval_iterations: 100       # images generated per evaluation pass
 
 prompts:
   - "a photo of a person"
@@ -230,7 +282,7 @@ prompts:
 
 image_height: 512
 image_width:  512
-batch_size: 1                 # increase if VRAM > 12 GB
+batch_size: 1              # increase if VRAM > 12 GB
 num_inference_steps: 20
 total_iterations: 500
 learning_rate: 1.0e-6
@@ -244,14 +296,14 @@ cd scripts
 python3 feedback_loop.py --config feedback_config.yaml
 ```
 
-Training outputs go to `feedback_output/`:
+Outputs go to `feedback_output/`:
 
 | File | Description |
 |------|-------------|
 | `step000X_imgY.png` | Sample images decoded every `save_images_every` steps |
 | `unet_stepXXXX.pth` | UNet checkpoints saved every `save_every` steps |
 | `unet_final.pth` | Final weights after all iterations |
-| `training_history.json` | Per-step loss and per-classifier attack success rate |
+| `training_history.json` | Pre/post evaluation results + full per-step training history |
 
 **3. Load the trained UNet back into a pipeline:**
 
@@ -275,6 +327,7 @@ image.save("evading_output.png")
 | `num_inference_steps` | `20` is fast; raise to `50` for higher quality samples |
 | `batch_size` | `1` for 10 GB VRAM; `2` for 16 GB+ |
 | `total_iterations` | `200–500` for initial experiments; `1000+` for full training |
+| `eval_iterations` | `100` gives stable detection rate estimates; lower to `20` for quick checks |
 | `save_every` | Keep low (`50`) so you can roll back if training diverges |
 
 ---

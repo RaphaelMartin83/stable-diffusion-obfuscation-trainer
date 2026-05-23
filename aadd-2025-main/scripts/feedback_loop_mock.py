@@ -325,13 +325,179 @@ def classifier_evasion_loss(
 
 
 # ===========================================================================
+# PURE-INFERENCE GENERATION (evaluation only — no grad)
+# ===========================================================================
+
+def generate_latents_inference(
+    unet: nn.Module,
+    scheduler: FakeScheduler,
+    text_embeddings: torch.Tensor,
+    latent_shape: tuple,
+    num_inference_steps: int,
+    guidance_scale: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Full DDIM pass under no_grad — used by the evaluator, never by the trainer."""
+    scheduler.set_timesteps(num_inference_steps)
+    latents = torch.randn(latent_shape, device=device) * scheduler.init_noise_sigma
+    for t in scheduler.timesteps:
+        latent_input = torch.cat([latents] * 2)
+        latent_input = scheduler.scale_model_input(latent_input, t)
+        noise_pred = unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+    return latents
+
+
+# ===========================================================================
+# EVALUATOR: measure fake-detection rate over N generated images
+# ===========================================================================
+
+def evaluate_detection(
+    unet: nn.Module,
+    vae: nn.Module,
+    scheduler,
+    text_encoder: nn.Module,
+    tokenizer,
+    evaluators: dict,
+    cfg: dict,
+    device: torch.device,
+    n_iters: int,
+    log_scale: bool,
+    label: str = "",
+) -> dict:
+    """
+    Generate n_iters images with the current UNet and count how many each
+    evaluator classifies as fake (class 1) vs. real (class 0).
+    """
+    unet.eval()
+    prompts: list[str] = cfg.get("prompts", ["a photo of a person"])
+    batch_size: int = int(cfg.get("batch_size", 1))
+    num_steps: int  = int(cfg.get("num_inference_steps", 3))
+    guidance: float = float(cfg.get("guidance_scale", 7.5))
+    latent_h = int(cfg.get("image_height", 64)) // 8
+    latent_w = int(cfg.get("image_width",  64)) // 8
+    latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
+
+    tag = f" [{label}]" if label else ""
+    print(f"\n[MOCK EVAL{tag}] Generating {n_iters} images...")
+    counts: dict[str, dict] = {n: {"fake": 0, "real": 0} for n in evaluators}
+
+    with torch.no_grad():
+        uncond_ids = tokenizer(
+            [""] * batch_size, padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True, return_tensors="pt",
+        ).input_ids.to(device)
+        uncond_emb = text_encoder(uncond_ids)[0]
+
+        for i in trange(n_iters, desc=f"Eval{tag}"):
+            prompt = prompts[i % len(prompts)]
+            cond_ids = tokenizer(
+                [prompt] * batch_size, padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True, return_tensors="pt",
+            ).input_ids.to(device)
+            text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
+
+            latents = generate_latents_inference(
+                unet, scheduler, text_embeddings,
+                latent_shape, num_steps, guidance, device,
+            )
+            pixel_01 = (vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1) + 1) / 2
+            pil_imgs = latent_to_pil(vae, latents)
+
+            for name, clf in evaluators.items():
+                if name.endswith("_dct"):
+                    tensors = torch.cat(
+                        [apply_classifier_transform(img, name, log_scale, device) for img in pil_imgs],
+                        dim=0,
+                    )
+                    logits = clf(tensors)
+                else:
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+                    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+                    size = (224, 224) if name == "vit_b_16" else (256, 256)
+                    logits = clf((F.interpolate(pixel_01, size=size, mode="bilinear", align_corners=False) - mean) / std)
+                for pred in logits.argmax(1):
+                    counts[name]["real" if pred.item() == CLASS_IDX_REAL else "fake"] += 1
+
+    unet.train()
+
+    results: dict = {}
+    for name, c in counts.items():
+        total = c["fake"] + c["real"]
+        results[name] = {
+            "detected_fake": c["fake"],
+            "detected_real": c["real"],
+            "total": total,
+            "fake_detection_rate": c["fake"] / total if total > 0 else 0.0,
+            "evasion_rate":        c["real"] / total if total > 0 else 0.0,
+        }
+    agg_fake  = sum(v["detected_fake"] for v in results.values())
+    agg_total = sum(v["total"]         for v in results.values())
+    results["_aggregate"] = {
+        "fake_detection_rate": agg_fake / agg_total if agg_total > 0 else 0.0,
+        "evasion_rate":        1.0 - (agg_fake / agg_total) if agg_total > 0 else 0.0,
+    }
+    return results
+
+
+def print_eval_report(results: dict, label: str):
+    W = 64
+    print(f"\n{'═'*W}")
+    print(f"  Evaluation Report — {label}")
+    print(f"{'═'*W}")
+    for name, s in results.items():
+        if name == "_aggregate":
+            continue
+        filled = round(s["fake_detection_rate"] * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        print(f"  {name:<17}  detected fake: {s['detected_fake']:>4}/{s['total']:<4}"
+              f"  [{bar}] {s['fake_detection_rate']:>6.1%}")
+    agg = results["_aggregate"]
+    print(f"  {'─'*60}")
+    filled = round(agg["fake_detection_rate"] * 20)
+    bar = "█" * filled + "░" * (20 - filled)
+    print(f"  {'AGGREGATE':<17}  detection rate:        [{bar}] {agg['fake_detection_rate']:>6.1%}")
+    print(f"  {'':17}  evasion  rate:         {'':22}{agg['evasion_rate']:>6.1%}")
+    print(f"{'═'*W}\n")
+
+
+def print_comparison(pre: dict, post: dict):
+    W = 64
+    pre_agg  = pre["_aggregate"]["fake_detection_rate"]
+    post_agg = post["_aggregate"]["fake_detection_rate"]
+    delta    = post_agg - pre_agg
+    arrow    = "▼" if delta < 0 else ("▲" if delta > 0 else "─")
+    print(f"\n{'═'*W}")
+    print(f"  Training Effect Summary")
+    print(f"{'═'*W}")
+    print(f"  {'Evaluator':<17}  {'Before':>8}   {'After':>8}   {'Δ':>7}")
+    print(f"  {'─'*60}")
+    for name in (n for n in pre if n != "_aggregate"):
+        p = pre[name]["fake_detection_rate"]
+        q = post[name]["fake_detection_rate"]
+        d = q - p
+        sym = "▼" if d < 0 else ("▲" if d > 0 else "─")
+        print(f"  {name:<17}  {p:>8.1%}   {q:>8.1%}   {sym}{abs(d):>5.1%}")
+    print(f"  {'─'*60}")
+    print(f"  {'AGGREGATE':<17}  {pre_agg:>8.1%}   {post_agg:>8.1%}   {arrow}{abs(delta):>5.1%}")
+    direction = "decreased" if delta < 0 else "increased"
+    print(f"\n  Fake detection {direction} by {abs(delta):.1%} after training.")
+    print(f"  Evasion rate: {pre['_aggregate']['evasion_rate']:.1%} "
+          f"→ {post['_aggregate']['evasion_rate']:.1%}")
+    print(f"{'═'*W}\n")
+
+
+# ===========================================================================
 # MAIN MOCK TRAINING LOOP
 # ===========================================================================
 
 def run_feedback_loop_mock(cfg: dict):
     device_str = cfg.get("device", "cpu")
-    # Force CPU in mock mode — mock models are tiny, CUDA not needed
-    device = torch.device("cpu")
+    device = torch.device("cpu")  # mock always runs on CPU
     print(f"[MOCK] Running on CPU (mock mode ignores device setting: '{device_str}')")
 
     log_scale = bool(cfg.get("dct_log_scale", True))
@@ -348,34 +514,57 @@ def run_feedback_loop_mock(cfg: dict):
     pipe.text_encoder.requires_grad_(False)
     unet.train()
     unet.requires_grad_(True)
+    print(f"[MOCK] FakeUNet parameters: {sum(p.numel() for p in unet.parameters()):,}")
 
-    total_params = sum(p.numel() for p in unet.parameters())
-    print(f"[MOCK] FakeUNet parameters: {total_params:,}")
-
-    # --- Load mock classifiers (random weights, no .pth) -----------------
-    clf_names = cfg.get("classifiers", ["resnet50", "densenet121", "vit_b_16", "densenet121_dct"])
+    # --- Load mock classifiers (training signal) -------------------------
+    clf_names: list[str] = cfg.get("classifiers", ["resnet50", "densenet121", "vit_b_16", "densenet121_dct"])
     classifiers: dict[str, nn.Module] = {}
     for name in clf_names:
         classifiers[name] = make_mock_classifier(name, device)
-        print(f"[MOCK] Loaded mock classifier '{name}' (random weights, frozen)")
+        print(f"[MOCK CLF]  '{name}' (random weights, frozen — training signal)")
 
-    # --- Optimizer --------------------------------------------------------
-    lr = float(cfg.get("learning_rate", 1e-4))  # higher LR OK for tiny mock model
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
-    grad_clip = float(cfg.get("grad_clip", 1.0))
+    # --- Load mock evaluators (measurement only) -------------------------
+    ev_names: list[str] = cfg.get("evaluator", clf_names)
+    evaluators: dict[str, nn.Module] = {}
+    for name in ev_names:
+        evaluators[name] = make_mock_classifier(name, device)
+        print(f"[MOCK EVAL] '{name}' (random weights, frozen — measurement only)")
 
-    # --- Generation settings ---------------------------------------------
-    prompts: list[str] = cfg.get("prompts", ["a photo of a person"])
-    batch_size: int    = int(cfg.get("batch_size", 1))
-    num_steps: int     = int(cfg.get("num_inference_steps", 3))
-    guidance: float    = float(cfg.get("guidance_scale", 7.5))
-    total_iters: int   = int(cfg.get("total_iterations", 10))
-    save_every: int    = int(cfg.get("save_every", 5))
+    # --- Settings --------------------------------------------------------
+    prompts: list[str]   = cfg.get("prompts", ["a photo of a person"])
+    batch_size: int      = int(cfg.get("batch_size", 1))
+    num_steps: int       = int(cfg.get("num_inference_steps", 3))
+    guidance: float      = float(cfg.get("guidance_scale", 7.5))
+    total_iters: int     = int(cfg.get("total_iterations", 10))
+    eval_iters: int      = int(cfg.get("eval_iterations", 5))
+    save_every: int      = int(cfg.get("save_every", 5))
     save_imgs_every: int = int(cfg.get("save_images_every", 3))
-    output_dir = Path(cfg.get("output_dir", "mock_output"))
+    lr                   = float(cfg.get("learning_rate", 1e-4))
+    grad_clip            = float(cfg.get("grad_clip", 1.0))
+    output_dir           = Path(cfg.get("output_dir", "mock_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-compute text embeddings
+    latent_h = int(cfg.get("image_height", 64)) // 8
+    latent_w = int(cfg.get("image_width",  64)) // 8
+    latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
+    print(f"[MOCK] Latent shape: {latent_shape}  "
+          f"(decoded pixels: {batch_size}×3×{latent_h*2}×{latent_w*2})\n")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 1 — Pre-training evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    pre_results = evaluate_detection(
+        unet, vae, pipe.scheduler, pipe.text_encoder, pipe.tokenizer,
+        evaluators, cfg, device, eval_iters, log_scale,
+        label="PRE-TRAINING",
+    )
+    print_eval_report(pre_results, "Pre-Training")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 2 — Training
+    # ═══════════════════════════════════════════════════════════════════════
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=lr)
+
     with torch.no_grad():
         uncond_ids = pipe.tokenizer(
             [""] * batch_size, padding="max_length",
@@ -383,30 +572,19 @@ def run_feedback_loop_mock(cfg: dict):
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         uncond_emb = pipe.text_encoder(uncond_ids)[0]
-
         cond_ids = pipe.tokenizer(
             [prompts[0]] * batch_size, padding="max_length",
             max_length=pipe.tokenizer.model_max_length,
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         cond_emb = pipe.text_encoder(cond_ids)[0]
+    text_embeddings = torch.cat([uncond_emb, cond_emb])
 
-    text_embeddings = torch.cat([uncond_emb, cond_emb])  # 2B×77×768
-
-    latent_h = int(cfg.get("image_height", 64)) // 8
-    latent_w = int(cfg.get("image_width",  64)) // 8
-    latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
-    print(f"[MOCK] Latent shape: {latent_shape}  (decoded pixels: "
-          f"{batch_size}×3×{latent_h*2}×{latent_w*2})\n")
-
-    # --- Training loop ---------------------------------------------------
     history = []
-    print(f"[MOCK] Starting mock feedback loop — {total_iters} iterations\n")
+    print(f"[MOCK] Starting feedback loop — {total_iters} training iterations\n")
 
     for step in trange(1, total_iters + 1, desc="Mock feedback loop"):
         prompt = prompts[(step - 1) % len(prompts)]
-
-        # Rotate conditional embedding with prompt
         if step > 1 and (step - 1) % len(prompts) == 0:
             with torch.no_grad():
                 cond_ids = pipe.tokenizer(
@@ -418,76 +596,58 @@ def run_feedback_loop_mock(cfg: dict):
             text_embeddings = torch.cat([uncond_emb, cond_emb])
 
         optimizer.zero_grad()
-
-        # 1. Generate latents
         latents = generate_latents_differentiable(
-            unet=unet,
-            scheduler=pipe.scheduler,
-            text_embeddings=text_embeddings,
-            latent_shape=latent_shape,
-            num_inference_steps=num_steps,
-            guidance_scale=guidance,
-            device=device,
+            unet=unet, scheduler=pipe.scheduler,
+            text_embeddings=text_embeddings, latent_shape=latent_shape,
+            num_inference_steps=num_steps, guidance_scale=guidance, device=device,
         )
-
-        # 2. Evasion loss
         loss, clf_info = classifier_evasion_loss(
-            vae=vae,
-            latents=latents,
-            classifiers=classifiers,
-            log_scale=log_scale,
-            device=device,
+            vae=vae, latents=latents, classifiers=classifiers,
+            log_scale=log_scale, device=device,
         )
-
-        # 3. Backprop + update
         loss.backward()
         torch.nn.utils.clip_grad_norm_(unet.parameters(), grad_clip)
         optimizer.step()
 
-        # 4. Log
-        asr_summary = "  ".join(
-            f"{n}={v['attack_success_rate']:.2f}" for n, v in clf_info.items()
-        )
+        asr_summary = "  ".join(f"{n}={v['attack_success_rate']:.2f}" for n, v in clf_info.items())
         print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}")
+        history.append({"step": step, "loss": loss.item(), "prompt": prompt, "classifiers": clf_info})
 
-        history.append({
-            "step": step,
-            "loss": loss.item(),
-            "prompt": prompt,
-            "classifiers": clf_info,
-        })
-
-        # 5. Save sample images
         if step % save_imgs_every == 0:
             pil_imgs = latent_to_pil(vae, latents.detach())
             for i, img in enumerate(pil_imgs):
                 img.save(output_dir / f"step{step:04d}_img{i}.png")
             print(f"    [MOCK] Saved {len(pil_imgs)} sample image(s) to {output_dir}/")
 
-        # 6. Save UNet checkpoint
         if step % save_every == 0:
             ckpt_path = output_dir / f"unet_mock_step{step:04d}.pth"
             torch.save(unet.state_dict(), ckpt_path)
             print(f"    [MOCK] Checkpoint saved: {ckpt_path}")
 
-        # 7. Persist JSON history
         with open(output_dir / "mock_training_history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    print(f"\n[MOCK] Done. Outputs in {output_dir}/")
-    print("[MOCK] All pipeline paths verified:")
-    print("  ✓ Config parsing")
-    print("  ✓ SD pipeline construction & device placement")
-    print("  ✓ Text embedding (tokenizer + encoder)")
-    print("  ✓ Differentiable DDIM sampling (no_grad + grad final step)")
-    print("  ✓ VAE decode → pixel tensor")
-    print("  ✓ Spatial classifier evasion loss (diff. path through VAE)")
-    print("  ✓ DCT classifier surrogate loss (detached PIL path)")
-    print("  ✓ Gradient backprop + AdamW UNet update")
-    print("  ✓ Gradient clipping")
-    print("  ✓ Image saving")
-    print("  ✓ UNet checkpoint saving")
-    print("  ✓ JSON history writing")
+    print(f"\n[MOCK] Training done.")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 3 — Post-training evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    post_results = evaluate_detection(
+        unet, vae, pipe.scheduler, pipe.text_encoder, pipe.tokenizer,
+        evaluators, cfg, device, eval_iters, log_scale,
+        label="POST-TRAINING",
+    )
+    print_eval_report(post_results, "Post-Training")
+    print_comparison(pre_results, post_results)
+
+    report = {
+        "pre_training":     pre_results,
+        "post_training":    post_results,
+        "training_history": history,
+    }
+    with open(output_dir / "mock_training_history.json", "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"[MOCK] Full report saved to {output_dir}/mock_training_history.json")
 
 
 # ---------------------------------------------------------------------------
