@@ -100,6 +100,185 @@ Participants were provided with a dataset divided into **sixteen subsets**:
 
 **Final Evaluation Scripts** [See here](scripts)
 
+---
+
+## 🚀 Getting Started
+
+This repository includes:
+- **`scripts/evaluate.py`** — evaluates adversarial robustness of classifiers against an existing adversarial image set
+- **`scripts/feedback_loop.py`** — fine-tunes a Stable Diffusion UNet so its output evades the classifiers (requires CUDA)
+- **`scripts/feedback_loop_mock.py`** — identical pipeline with tiny stub models for CPU testing (no GPU, no model download)
+
+### Repository layout
+
+```
+aadd-2025-main/
+├── code/
+│   └── classifier.py
+├── scripts/
+│   ├── config.yaml                 ← evaluate.py config
+│   ├── evaluate.py
+│   ├── feedback_config.yaml        ← real feedback loop config
+│   ├── feedback_loop.py
+│   ├── feedback_mock_config.yaml   ← mock feedback loop config
+│   └── feedback_loop_mock.py
+├── requirements_mock.txt           ← CPU-only deps
+└── requirements.txt                ← full CUDA deps (includes mock)
+```
+
+Classifier weights (`.pth`) go in `models/.models/`:
+```
+models/.models/
+├── densenet121.pth
+├── densenet121_dct.pth
+├── resnet50.pth
+└── vit_b_16.pth
+```
+
+---
+
+## 🖥️ Environment Setup
+
+### Option A — CPU / mock mode (any machine, no GPU required)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements_mock.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+### Option B — Full mode (CUDA-capable machine)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+`torch` from PyPI automatically installs the CUDA-enabled build when CUDA drivers are present — no extra flags needed.
+
+---
+
+## 📐 Evaluating Adversarial Robustness
+
+`evaluate.py` takes a set of original images and their adversarial counterparts, runs all classifiers, and produces an SSIM-weighted attack success score.
+
+**1. Edit `scripts/config.yaml`** to point to your directories:
+
+```yaml
+original_root: test_set_deepfake/Dataset/test/fake
+adv_root:      adversarial_dataset/Dataset/test/fake
+models_dir:    ../.models           # folder containing *.pth weight files
+classifiers:
+  - resnet50
+  - densenet121
+  - vit_b_16
+  - densenet121_dct
+save_json: results.json
+```
+
+**2. Run:**
+
+```bash
+cd scripts
+python3 evaluate.py --config config.yaml
+```
+
+Output printed to stdout and optionally saved as JSON (`save_json` key in config).
+
+---
+
+## 🔁 Feedback Loop — Fine-tune SD to Evade Classifiers
+
+The feedback loop generates images with Stable Diffusion and backpropagates the classifier evasion signal into the UNet weights. After training, the fine-tuned UNet produces images the classifiers label as "real".
+
+### Mock mode (CPU — verifies the full pipeline without any downloads)
+
+Use this to validate the code before moving to a CUDA machine.
+
+```bash
+cd scripts
+python3 feedback_loop_mock.py --config feedback_mock_config.yaml
+```
+
+All 10 iterations complete in ~1 second. Outputs go to `scripts/mock_output/`:
+- `step000X_imgY.png` — decoded sample images
+- `unet_mock_stepXXXX.pth` — UNet checkpoints
+- `mock_training_history.json` — per-step loss and attack success rate
+
+### Real mode (CUDA — trains actual Stable Diffusion)
+
+**1. Edit `scripts/feedback_config.yaml`:**
+
+```yaml
+# HuggingFace model ID or path to a local SD 1.x / 2.x checkpoint
+sd_model_id: "runwayml/stable-diffusion-v1-5"
+
+models_dir: ../../models/.models
+classifiers:
+  - resnet50
+  - densenet121
+  - vit_b_16
+  - densenet121_dct
+
+prompts:
+  - "a photo of a person"
+  - "a realistic portrait photograph"
+
+image_height: 512
+image_width:  512
+batch_size: 1                 # increase if VRAM > 12 GB
+num_inference_steps: 20
+total_iterations: 500
+learning_rate: 1.0e-6
+output_dir: feedback_output
+```
+
+**2. Run:**
+
+```bash
+cd scripts
+python3 feedback_loop.py --config feedback_config.yaml
+```
+
+Training outputs go to `feedback_output/`:
+
+| File | Description |
+|------|-------------|
+| `step000X_imgY.png` | Sample images decoded every `save_images_every` steps |
+| `unet_stepXXXX.pth` | UNet checkpoints saved every `save_every` steps |
+| `unet_final.pth` | Final weights after all iterations |
+| `training_history.json` | Per-step loss and per-classifier attack success rate |
+
+**3. Load the trained UNet back into a pipeline:**
+
+```python
+from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5")
+pipe.unet.load_state_dict(torch.load("feedback_output/unet_final.pth"))
+pipe = pipe.to("cuda")
+
+image = pipe("a photo of a person").images[0]
+image.save("evading_output.png")
+```
+
+### Tuning tips
+
+| Setting | Recommendation |
+|---------|---------------|
+| `learning_rate` | Start at `1e-6`; lower to `5e-7` if image quality degrades |
+| `num_inference_steps` | `20` is fast; raise to `50` for higher quality samples |
+| `batch_size` | `1` for 10 GB VRAM; `2` for 16 GB+ |
+| `total_iterations` | `200–500` for initial experiments; `1000+` for full training |
+| `save_every` | Keep low (`50`) so you can roll back if training diverges |
+
+---
+
 ## 🏆 Results & Rankings
 
 The challenge ended with strong global participation. Here are the final standings:
