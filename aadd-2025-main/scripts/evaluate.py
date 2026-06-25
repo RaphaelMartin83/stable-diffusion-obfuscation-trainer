@@ -172,7 +172,7 @@ def load_model(name, weight_path, device):
     else:
         raise ValueError(f"Unsupported model '{name}'")
 
-    state = torch.load(weight_path, map_location=device)
+    state = torch.load(weight_path, map_location=device, weights_only=False)
     model.load_state_dict(state)
     model.eval().to(device)
     print(f"[MODEL] '{name}' ready on {device}\n")
