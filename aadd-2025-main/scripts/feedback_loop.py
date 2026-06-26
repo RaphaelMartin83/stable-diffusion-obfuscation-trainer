@@ -165,8 +165,9 @@ def apply_classifier_transform(
 
 def latent_to_pil(vae, latents: torch.Tensor) -> list[Image.Image]:
     """Decode VAE latents to a list of PIL images (no grad)."""
+    vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
-        imgs = vae.decode(latents / vae.config.scaling_factor).sample
+        imgs = vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample
     imgs = (imgs.clamp(-1, 1) + 1) / 2  # [0, 1]
     imgs = (imgs * 255).byte().cpu().permute(0, 2, 3, 1).numpy()
     return [Image.fromarray(arr) for arr in imgs]
@@ -253,7 +254,8 @@ def classifier_evasion_loss(
     target_label = torch.zeros(latents.shape[0], dtype=torch.long, device=device)  # class 0 = real
 
     # Decode with grad
-    pixel_tensors = vae.decode(latents / vae.config.scaling_factor).sample  # B×3×H×W in [-1,1]
+    vae_dtype = next(vae.parameters()).dtype
+    pixel_tensors = vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample  # B×3×H×W in [-1,1]
     pixel_01 = (pixel_tensors.clamp(-1, 1) + 1) / 2  # [0, 1]
 
     total_loss = torch.tensor(0.0, device=device)
@@ -385,7 +387,8 @@ def evaluate_detection(
                 unet, scheduler, text_embeddings,
                 latent_shape, num_steps, guidance, device,
             )
-            pixel_01 = (vae.decode(latents / vae.config.scaling_factor).sample.clamp(-1, 1) + 1) / 2
+            vae_dtype = next(vae.parameters()).dtype
+            pixel_01 = (vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample.clamp(-1, 1) + 1) / 2
             pil_imgs = latent_to_pil(vae, latents)
 
             for name, clf in evaluators.items():
@@ -502,6 +505,7 @@ def run_feedback_loop(cfg: dict):
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    unet.float()  # upcast to fp32 for stable training; fp16 AdamW causes gradient overflow → NaN → black images
     unet.train()
     unet.requires_grad_(True)
     print(f"[SD] UNet parameters: {sum(p.numel() for p in unet.parameters()):,}")
