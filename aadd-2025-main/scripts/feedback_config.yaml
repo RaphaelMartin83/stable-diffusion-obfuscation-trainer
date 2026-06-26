@@ -11,7 +11,7 @@
 sd_model_id: "runwayml/stable-diffusion-v1-5"
 
 # --- Classifiers (same names as evaluate.py) --------------------------
-models_dir: ../../models/.models
+models_dir: ../models/.models
 
 # classifiers are used as the adversarial training signal (gradient flows through these)
 classifiers:
