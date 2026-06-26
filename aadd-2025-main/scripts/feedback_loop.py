@@ -314,7 +314,9 @@ def generate_latents_inference(
 ) -> torch.Tensor:
     """Full DDIM pass under no_grad — used by the evaluator, never by the trainer."""
     scheduler.set_timesteps(num_inference_steps)
-    latents = torch.randn(latent_shape, device=device) * scheduler.init_noise_sigma
+    unet_dtype = next(unet.parameters()).dtype
+    latents = torch.randn(latent_shape, device=device, dtype=unet_dtype) * scheduler.init_noise_sigma
+    text_embeddings = text_embeddings.to(dtype=unet_dtype)
     for t in scheduler.timesteps:
         latent_input = torch.cat([latents] * 2)
         latent_input = scheduler.scale_model_input(latent_input, t)
