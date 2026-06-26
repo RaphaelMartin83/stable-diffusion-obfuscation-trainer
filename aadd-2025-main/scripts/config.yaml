@@ -1,4 +1,4 @@
-original_root: test_set_deepfake/Dataset/test/fake          
+original_root: ../test_set_deepfake/Dataset/test/fake
 adv_root: adversarial_dataset/Dataset/test/fake     
 
 models_dir: ../../models/.models
