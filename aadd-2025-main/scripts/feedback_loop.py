@@ -68,14 +68,14 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 # ---------------------------------------------------------------------------
 
 def create_resnet18_dct():
-    model = tv_models.resnet18(pretrained=False)
+    model = tv_models.resnet18(weights=None)
     model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     model.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(model.fc.in_features, CLASSES))
     return model
 
 
 def create_densenet121_dct():
-    model = tv_models.densenet121(pretrained=False)
+    model = tv_models.densenet121(weights=None)
     model.features.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     model.classifier = nn.Sequential(
         nn.Dropout(0.2), nn.Linear(model.classifier.in_features, CLASSES)
@@ -196,8 +196,10 @@ def generate_latents_differentiable(
     scheduler.set_timesteps(num_inference_steps)
     timesteps = scheduler.timesteps
 
-    latents = torch.randn(latent_shape, generator=generator, device=device)
+    unet_dtype = next(unet.parameters()).dtype
+    latents = torch.randn(latent_shape, generator=generator, device=device, dtype=unet_dtype)
     latents = latents * scheduler.init_noise_sigma
+    text_embeddings = text_embeddings.to(dtype=unet_dtype)
 
     # All steps except the last: no grad (saves memory)
     with torch.no_grad():
