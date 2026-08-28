@@ -58,6 +58,14 @@ grad_clip: 1.0                  # gradient norm clipping
 iqa_metric: clipiqa             # pyiqa metric name (clipiqa | musiq | maniqa | ...)
 iqa_weight: 0.3                 # relative weight vs. detector loss (both roughly [0,1])
 
+# --- Anti-drift distillation to a frozen reference UNet ---------------
+# Keeps the trainable UNet's noise prediction close to the original SD
+# prior (MSE on the raw noise pred at the final DDIM step). The single
+# biggest fix for the "attack succeeds but images turn blurry" failure
+# mode. Costs ~1× UNet in extra VRAM.
+# Set distill_weight to 0 (or omit) to disable — no reference is loaded.
+distill_weight: 1.0             # try 0.5–5.0; higher = more faithful to SD, less room to evade
+
 # --- Checkpointing & output -------------------------------------------
 output_dir: feedback_output
 save_every: 50                  # save UNet checkpoint every N steps

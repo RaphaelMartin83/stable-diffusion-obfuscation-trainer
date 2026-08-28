@@ -39,6 +39,7 @@ Requirements (in addition to evaluate.py deps)
 import argparse
 import json
 import warnings
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -229,13 +230,19 @@ def generate_latents_differentiable(
     guidance_scale: float,
     device: torch.device,
     generator: torch.Generator | None = None,
-) -> torch.Tensor:
+    ref_unet: nn.Module | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Run DDIM sampling keeping gradients alive through the final UNet step.
 
     All denoising steps except the last are run under `torch.no_grad()` for
     memory efficiency.  The final step is run with gradients so that the loss
     can propagate back through UNet → latent → VAE decode.
+
+    If ``ref_unet`` is provided, the frozen reference is run on the same
+    latent/timestep and an MSE distillation loss on the raw noise prediction
+    is returned alongside the latents.  This is the anti-drift signal that
+    keeps the trainable UNet close to the original SD prior.
     """
     scheduler.set_timesteps(num_inference_steps)
     timesteps = scheduler.timesteps
@@ -260,11 +267,18 @@ def generate_latents_differentiable(
     latent_input = torch.cat([latents] * 2)
     latent_input = scheduler.scale_model_input(latent_input, t)
     noise_pred = unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+
+    distill_loss: torch.Tensor | None = None
+    if ref_unet is not None:
+        with torch.no_grad():
+            ref_noise_pred = ref_unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+        distill_loss = F.mse_loss(noise_pred, ref_noise_pred.detach())
+
     noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
     latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-    return latents  # gradients flow through this
+    return latents, distill_loss
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +624,18 @@ def run_feedback_loop(cfg: dict):
         iqa_metric = load_iqa_metric(iqa_name, device)
         print(f"[IQA]  Loaded '{iqa_name}' (weight={iqa_weight}, frozen)")
 
+    # --- Optional anti-drift distillation to a frozen reference UNet -------
+    # Deepcopy the current UNet BEFORE any training so the reference captures
+    # the original SD prior. Only the trainable UNet's noise prediction gets
+    # gradients; the reference is frozen and eval-mode.
+    distill_weight = float(cfg.get("distill_weight", 0.0))
+    ref_unet: nn.Module | None = None
+    if distill_weight > 0:
+        ref_unet = deepcopy(unet)
+        ref_unet.eval()
+        ref_unet.requires_grad_(False)
+        print(f"[DISTILL] Loaded frozen reference UNet (weight={distill_weight})")
+
     # ═══════════════════════════════════════════════════════════════════════
     # PHASE 1 — Pre-training evaluation
     # ═══════════════════════════════════════════════════════════════════════
@@ -661,16 +687,20 @@ def run_feedback_loop(cfg: dict):
 
         optimizer.zero_grad()
 
-        latents = generate_latents_differentiable(
+        latents, distill_loss = generate_latents_differentiable(
             unet=unet, scheduler=pipe.scheduler,
             text_embeddings=text_embeddings, latent_shape=latent_shape,
             num_inference_steps=num_steps, guidance_scale=guidance, device=device,
+            ref_unet=ref_unet,
         )
         loss, clf_info = classifier_evasion_loss(
             vae=vae, latents=latents, classifiers=classifiers,
             log_scale=log_scale, device=device,
             iqa_metric=iqa_metric, iqa_weight=iqa_weight,
         )
+        if distill_loss is not None:
+            loss = loss + distill_weight * distill_loss
+            clf_info["_distill"] = {"loss": distill_loss.item(), "weight": distill_weight}
         loss.backward()
         torch.nn.utils.clip_grad_norm_(unet.parameters(), grad_clip)
         optimizer.step()
@@ -681,7 +711,8 @@ def run_feedback_loop(cfg: dict):
             for n, v in clf_info.items() if not n.startswith("_")
         )
         iqa_str = f"  iqa={clf_info['_iqa']['loss']:.3f}" if "_iqa" in clf_info else ""
-        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}")
+        distill_str = f"  distill={clf_info['_distill']['loss']:.4f}" if "_distill" in clf_info else ""
+        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}{distill_str}")
 
         if step % save_images_every == 0:
             pil_imgs = latent_to_pil(vae, latents.detach())
