@@ -22,3 +22,6 @@
 diffusers>=0.27.0
 transformers>=4.38.0
 accelerate>=0.28.0
+
+# No-reference image-quality metrics (CLIP-IQA etc.) for the perceptual loss term
+pyiqa>=0.1.10

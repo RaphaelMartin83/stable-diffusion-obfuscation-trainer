@@ -55,6 +55,11 @@ from torchvision import models as tv_models
 
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 
+try:
+    import pyiqa
+except ImportError:
+    pyiqa = None
+
 # ---------------------------------------------------------------------------
 # Constants (mirrored from evaluate.py)
 # ---------------------------------------------------------------------------
@@ -107,6 +112,34 @@ def load_classifier(name: str, weight_path: Path, device: torch.device) -> nn.Mo
     for p in model.parameters():
         p.requires_grad_(False)
     return model.to(device)
+
+
+# ---------------------------------------------------------------------------
+# No-reference IQA metric loader (differentiable perceptual-quality term)
+# ---------------------------------------------------------------------------
+
+def load_iqa_metric(name: str, device: torch.device):
+    """Load a pyiqa NR-IQA metric wrapped as a differentiable loss.
+
+    Returns a callable f(x) → scalar where x is B×3×H×W in [0,1] and the
+    returned value is a LOSS (lower = better). Higher-is-better metrics are
+    inverted to (1 - score) so the caller can always minimise.
+    """
+    if pyiqa is None:
+        raise ImportError("pyiqa is required for the IQA loss; run `pip install pyiqa`.")
+    metric = pyiqa.create_metric(name, as_loss=True, device=device)
+    for p in metric.parameters():
+        p.requires_grad_(False)
+    metric.eval()
+    # pyiqa exposes `lower_better` on the metric object; default assumption is
+    # higher-is-better if the attribute is missing.
+    higher_better = not bool(getattr(metric, "lower_better", False))
+
+    def _loss(x: torch.Tensor) -> torch.Tensor:
+        score = metric(x)
+        return (1.0 - score).mean() if higher_better else score.mean()
+
+    return _loss
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +267,8 @@ def classifier_evasion_loss(
     classifiers: dict,
     log_scale: bool,
     device: torch.device,
+    iqa_metric=None,
+    iqa_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """
     Decode latents → PIL images, run every classifier, return combined loss.
@@ -300,7 +335,12 @@ def classifier_evasion_loss(
             "attack_success_rate": attack_success,
         }
 
-    return total_loss / len(classifiers), per_clf_info
+    detector_loss = total_loss / len(classifiers)
+    if iqa_metric is not None and iqa_weight > 0:
+        iqa_loss = iqa_metric(pixel_01.float())
+        per_clf_info["_iqa"] = {"loss": iqa_loss.item(), "weight": iqa_weight}
+        return detector_loss + iqa_weight * iqa_loss, per_clf_info
+    return detector_loss, per_clf_info
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +586,14 @@ def run_feedback_loop(cfg: dict):
     output_dir           = Path(cfg.get("output_dir", "feedback_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Optional IQA loss --------------------------------------------------
+    iqa_name   = str(cfg.get("iqa_metric", "clipiqa"))
+    iqa_weight = float(cfg.get("iqa_weight", 0.0))
+    iqa_metric = None
+    if iqa_weight > 0:
+        iqa_metric = load_iqa_metric(iqa_name, device)
+        print(f"[IQA]  Loaded '{iqa_name}' (weight={iqa_weight}, frozen)")
+
     # ═══════════════════════════════════════════════════════════════════════
     # PHASE 1 — Pre-training evaluation
     # ═══════════════════════════════════════════════════════════════════════
@@ -605,14 +653,19 @@ def run_feedback_loop(cfg: dict):
         loss, clf_info = classifier_evasion_loss(
             vae=vae, latents=latents, classifiers=classifiers,
             log_scale=log_scale, device=device,
+            iqa_metric=iqa_metric, iqa_weight=iqa_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(unet.parameters(), grad_clip)
         optimizer.step()
 
         history.append({"step": step, "loss": loss.item(), "prompt": prompt, "classifiers": clf_info})
-        asr_summary = "  ".join(f"{n}={v['attack_success_rate']:.2f}" for n, v in clf_info.items())
-        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}")
+        asr_summary = "  ".join(
+            f"{n}={v['attack_success_rate']:.2f}"
+            for n, v in clf_info.items() if not n.startswith("_")
+        )
+        iqa_str = f"  iqa={clf_info['_iqa']['loss']:.3f}" if "_iqa" in clf_info else ""
+        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}")
 
         if step % save_images_every == 0:
             pil_imgs = latent_to_pil(vae, latents.detach())

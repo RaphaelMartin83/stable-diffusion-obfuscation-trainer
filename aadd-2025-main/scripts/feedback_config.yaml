@@ -49,6 +49,13 @@ total_iterations: 500           # total feedback steps
 learning_rate: 1.0e-6           # keep small to avoid destroying generative quality
 grad_clip: 1.0                  # gradient norm clipping
 
+# --- Image Quality Assessment (NR-IQA) --------------------------------
+# Adds a differentiable perceptual-quality term to the loss so generated
+# images don't just fool detectors but also look natural to a human.
+# Set iqa_weight to 0 (or omit the block) to disable — no metric is loaded.
+iqa_metric: clipiqa             # pyiqa metric name (clipiqa | musiq | maniqa | ...)
+iqa_weight: 0.3                 # relative weight vs. detector loss (both roughly [0,1])
+
 # --- Checkpointing & output -------------------------------------------
 output_dir: feedback_output
 save_every: 50                  # save UNet checkpoint every N steps
