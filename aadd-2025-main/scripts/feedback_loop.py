@@ -55,6 +55,8 @@ from torchvision import models as tv_models
 
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 
+from cavia_utils import LaDeDa9
+
 try:
     import pyiqa
 except ImportError:
@@ -102,10 +104,18 @@ def load_classifier(name: str, weight_path: Path, device: torch.device) -> nn.Mo
         model = create_resnet18_dct()
     elif name == "densenet121_dct":
         model = create_densenet121_dct()
+    elif name == "cavia2024":
+        model = LaDeDa9(num_classes=1)
+        model.fc = nn.Linear(2048, 1)
     else:
         raise ValueError(f"Unsupported classifier: {name}")
 
-    state = torch.load(weight_path, map_location=device)
+    # cavia2024 checkpoints wrap the state_dict alongside an argparse.Namespace,
+    # which PyTorch 2.6's default weights_only=True refuses to unpickle.
+    load_kwargs = {"weights_only": False} if name == "cavia2024" else {}
+    state = torch.load(weight_path, map_location=device, **load_kwargs)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
     model.load_state_dict(state)
     model.eval()
     # Freeze all classifier parameters
@@ -325,6 +335,10 @@ def classifier_evasion_loss(
                 resized = F.interpolate(pixel_01, size=(256, 256), mode="bilinear", align_corners=False)
             normalised = (resized - mean) / std
             logits = clf(normalised)
+            if name == "cavia2024":
+                # LaDeDa9 emits a single logit per image; convert to 2-class
+                # form matching CLASS_IDX_REAL=0 (higher raw logit = more "fake").
+                logits = torch.cat([-logits, logits], dim=-1)
             loss_clf = F.cross_entropy(logits, target_label)
             pred_labels = logits.argmax(1)
 
@@ -443,6 +457,8 @@ def evaluate_detection(
                     std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
                     size = (224, 224) if name == "vit_b_16" else (256, 256)
                     logits = clf((F.interpolate(pixel_01, size=size, mode="bilinear", align_corners=False) - mean) / std)
+                    if name == "cavia2024":
+                        logits = torch.cat([-logits, logits], dim=-1)
                 for pred in logits.argmax(1):
                     counts[name]["real" if pred.item() == CLASS_IDX_REAL else "fake"] += 1
 

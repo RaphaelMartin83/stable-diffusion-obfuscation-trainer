@@ -17,6 +17,7 @@ models_dir: ../models/.models
 classifiers:
   - resnet50
   - densenet121
+  - cavia2024
 
 # evaluator models are used only for measurement — no gradient, just counting detections
 # defaults to 'classifiers' if omitted
@@ -25,6 +26,7 @@ evaluator:
   - densenet121
   - vit_b_16
   - densenet121_dct
+  - cavia2024
 
 # number of images generated for each evaluation pass (pre- and post-training)
 eval_iterations: 100
