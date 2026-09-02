@@ -422,7 +422,8 @@ def evaluate_detection(
     Returns per-evaluator stats and an aggregate.
     """
     unet.eval()
-    prompts: list[str] = cfg.get("prompts", ["a photo of a person"])
+    prompt: str = cfg.get("prompt", "a photo of a person")
+    negative_prompt: str = cfg.get("negative_prompt", "")
     batch_size: int = int(cfg.get("batch_size", 1))
     num_steps: int = int(cfg.get("num_inference_steps", 20))
     guidance: float = float(cfg.get("guidance_scale", 7.5))
@@ -436,21 +437,19 @@ def evaluate_detection(
 
     with torch.no_grad():
         uncond_ids = tokenizer(
-            [""] * batch_size, padding="max_length",
+            [negative_prompt] * batch_size, padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         uncond_emb = text_encoder(uncond_ids)[0]
+        cond_ids = tokenizer(
+            [prompt] * batch_size, padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True, return_tensors="pt",
+        ).input_ids.to(device)
+        text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
 
         for i in trange(n_iters, desc=f"Eval{tag}"):
-            prompt = prompts[i % len(prompts)]
-            cond_ids = tokenizer(
-                [prompt] * batch_size, padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True, return_tensors="pt",
-            ).input_ids.to(device)
-            text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
-
             latents = generate_latents_inference(
                 unet, scheduler, text_embeddings,
                 latent_shape, num_steps, guidance, device,
@@ -603,7 +602,8 @@ def run_feedback_loop(cfg: dict):
         print(f"[EVAL] Loaded '{ev_name}' (frozen — measurement only)")
 
     # --- Settings -----------------------------------------------------------
-    prompts: list[str]   = cfg.get("prompts", ["a photo of a person"])
+    prompt: str          = cfg.get("prompt", "a photo of a person")
+    negative_prompt: str = cfg.get("negative_prompt", "")
     batch_size: int      = int(cfg.get("batch_size", 1))
     num_steps: int       = int(cfg.get("num_inference_steps", 20))
     guidance: float      = float(cfg.get("guidance_scale", 7.5))
@@ -653,13 +653,13 @@ def run_feedback_loop(cfg: dict):
 
     with torch.no_grad():
         uncond_ids = tokenizer(
-            [""] * batch_size, padding="max_length",
+            [negative_prompt] * batch_size, padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
         uncond_emb = text_encoder(uncond_ids)[0]
         cond_ids = tokenizer(
-            [prompts[0]] * batch_size, padding="max_length",
+            [prompt] * batch_size, padding="max_length",
             max_length=tokenizer.model_max_length,
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
@@ -674,17 +674,6 @@ def run_feedback_loop(cfg: dict):
     print(f"\n[LOOP] Starting feedback loop for {total_iterations} iterations\n")
 
     for step in trange(1, total_iterations + 1, desc="Feedback loop"):
-        prompt = prompts[(step - 1) % len(prompts)]
-        if step > 1 and (step - 1) % len(prompts) == 0:
-            with torch.no_grad():
-                cond_ids = tokenizer(
-                    [prompt] * batch_size, padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True, return_tensors="pt",
-                ).input_ids.to(device)
-                cond_emb = text_encoder(cond_ids)[0]
-            text_embeddings = torch.cat([uncond_emb, cond_emb])
-
         optimizer.zero_grad()
 
         latents, distill_loss = generate_latents_differentiable(

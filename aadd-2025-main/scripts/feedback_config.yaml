@@ -33,13 +33,6 @@ eval_iterations: 100
 
 dct_log_scale: true
 
-# --- Generation settings ----------------------------------------------
-# Prompts are rotated across iterations.
-prompts:
-  - "a photo of a person"
-  - "a realistic portrait photograph"
-  - "a photorealistic human face, studio lighting"
-
 image_height: 512
 image_width:  512
 batch_size: 1                   # increase if VRAM allows
@@ -51,8 +44,6 @@ total_iterations: 500           # total feedback steps
 learning_rate: 1.0e-6           # keep small to avoid destroying generative quality
 grad_clip: 1.0                  # gradient norm clipping
 
-# --- Image Quality Assessment (NR-IQA) --------------------------------
-# Adds a differentiable perceptual-quality term to the loss so generated
 # images don't just fool detectors but also look natural to a human.
 # Set iqa_weight to 0 (or omit the block) to disable — no metric is loaded.
 iqa_metric: clipiqa             # pyiqa metric name (clipiqa | musiq | maniqa | ...)
@@ -65,6 +56,11 @@ iqa_weight: 0.3                 # relative weight vs. detector loss (both roughl
 # mode. Costs ~1× UNet in extra VRAM.
 # Set distill_weight to 0 (or omit) to disable — no reference is loaded.
 distill_weight: 1.0             # try 0.5–5.0; higher = more faithful to SD, less room to evade
+
+# --- Generation settings ----------------------------------------------
+# Single fixed positive/negative prompt pair (no rotation).
+prompt: "RAW photo, a photorealistic portrait of a person, shot on a Sony A7R V with an 85mm f/1.4 lens, natural lighting, ultra-detailed skin texture and pores, sharp focus, high dynamic range, unedited DSLR photograph, 8k uhd, professional photography"
+negative_prompt: "cartoon, illustration, painting, drawing, anime, 3d render, cgi, video game, plastic skin, airbrushed, smooth skin, waxy, deformed, disfigured, extra limbs, blurry, out of focus, low quality, low resolution, jpeg artifacts, grainy, oversaturated, black and white, sketch, digital art, watermark, text, logo, signature"
 
 # --- Checkpointing & output -------------------------------------------
 output_dir: feedback_output
