@@ -27,6 +27,15 @@ dataset_root: test_set_deepfake/Dataset/test/fake
 # it (closer to full txt2img). Start around 0.3–0.4.
 img2img_strength: 0.35
 
+# Hard L-infinity pixel bound (in [0,1] units, e.g. 0.06 ≈ 15/255) between
+# the generated output and the real seed image. This is the actual fix for
+# the "adversarial loss destroys the face into blotchy noise" failure mode:
+# soft penalties (tv_weight/recon_weight/iqa_weight below) only discourage
+# drift and got outweighed by the classifier gradient over enough steps —
+# this makes it structurally impossible to exceed, regardless of training
+# length. Only applies when dataset_root is set. 0 disables it.
+perturbation_epsilon: 0.06
+
 # --- Classifiers (same names as evaluate.py) --------------------------
 models_dir: ../models/.models
 

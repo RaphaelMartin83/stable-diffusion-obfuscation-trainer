@@ -215,14 +215,43 @@ def apply_classifier_transform(
 # Differentiable image conversion: latent tensor → PIL
 # ---------------------------------------------------------------------------
 
-def latent_to_pil(vae, latents: torch.Tensor) -> list[Image.Image]:
-    """Decode VAE latents to a list of PIL images (no grad)."""
+def clip_to_epsilon_ball(pixel_01: torch.Tensor, anchor_01: torch.Tensor, epsilon: float) -> torch.Tensor:
+    """Hard L-infinity projection onto [anchor - eps, anchor + eps] (PGD-style).
+
+    Unlike the soft tv/recon/iqa losses (which only *discourage* drift and
+    can be outweighed by a strong-enough classifier gradient over many
+    steps), this makes it structurally impossible for the output to differ
+    from the real seed image by more than `epsilon` per pixel — the actual
+    guarantee the challenge's "preserve visual similarity" requirement needs.
+    """
+    lo = (anchor_01 - epsilon).clamp(0.0, 1.0)
+    hi = (anchor_01 + epsilon).clamp(0.0, 1.0)
+    return torch.max(torch.min(pixel_01, hi), lo)
+
+
+def pixels_01_to_pil(pixel_01: torch.Tensor) -> list[Image.Image]:
+    """Convert an already-decoded Bx3xHxW [0,1] tensor to PIL images (no grad)."""
+    imgs = (pixel_01.detach().clamp(0, 1) * 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+    return [Image.fromarray(arr) for arr in imgs]
+
+
+def latent_to_pil(
+    vae, latents: torch.Tensor,
+    anchor_01: torch.Tensor | None = None, epsilon: float = 0.0,
+) -> list[Image.Image]:
+    """Decode VAE latents to a list of PIL images (no grad).
+
+    If `anchor_01`/`epsilon` are given, the decoded image is hard-clipped to
+    the epsilon ball around the real seed image before conversion, so saved
+    samples reflect the actual bounded output rather than the raw decode.
+    """
     vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
         imgs = vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample
-    imgs = (imgs.clamp(-1, 1) + 1) / 2  # [0, 1]
-    imgs = (imgs * 255).byte().cpu().permute(0, 2, 3, 1).numpy()
-    return [Image.fromarray(arr) for arr in imgs]
+    pixel_01 = (imgs.clamp(-1, 1) + 1) / 2  # [0, 1]
+    if anchor_01 is not None and epsilon > 0:
+        pixel_01 = clip_to_epsilon_ball(pixel_01, anchor_01, epsilon)
+    return pixels_01_to_pil(pixel_01)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +449,7 @@ def classifier_evasion_loss(
     tv_weight: float = 0.0,
     anchor_pixels_01: torch.Tensor | None = None,
     recon_weight: float = 0.0,
+    epsilon: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """
     Decode latents → PIL images, run every classifier, return combined loss.
@@ -444,15 +474,21 @@ def classifier_evasion_loss(
     pixel_tensors = vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample  # B×3×H×W in [-1,1]
     pixel_01 = (pixel_tensors.clamp(-1, 1) + 1) / 2  # [0, 1]
 
+    if anchor_pixels_01 is not None and epsilon > 0:
+        # Hard bound: every classifier below sees (and is scored against) an
+        # image that can never exceed `epsilon` pixel distance from the real
+        # seed photo, regardless of how strongly the loss wants to change it.
+        pixel_01 = clip_to_epsilon_ball(pixel_01, anchor_pixels_01, epsilon)
+
     total_loss = torch.tensor(0.0, device=device)
     per_clf_info = {}
 
     for name, clf in classifiers.items():
         if name.endswith("_dct"):
-            # DCT classifiers: convert to PIL then to numpy (no grad path)
-            # We detach here because the DCT is not differentiable in PyTorch;
-            # the spatial classifiers carry the gradient signal.
-            pil_imgs = latent_to_pil(vae, latents.detach())
+            # DCT classifiers: convert the already-decoded (and possibly
+            # epsilon-clipped) pixels to PIL — no grad path either way since
+            # the DCT itself isn't differentiable in PyTorch.
+            pil_imgs = pixels_01_to_pil(pixel_01)
             tensors = torch.cat(
                 [apply_classifier_transform(img, name, log_scale, device) for img in pil_imgs],
                 dim=0,
@@ -560,6 +596,7 @@ def evaluate_detection(
     label: str = "",
     dataset_paths: list[Path] | None = None,
     img2img_strength: float = 0.35,
+    epsilon: float = 0.0,
 ) -> dict:
     """
     Generate n_iters images with the current UNet and count how many each
@@ -600,8 +637,9 @@ def evaluate_detection(
         text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
 
         for i in trange(n_iters, desc=f"Eval{tag}"):
+            anchor_01 = None
             if dataset_paths:
-                init_latents, _ = sample_dataset_latents(vae, dataset_paths, batch_size, image_h, image_w, device)
+                init_latents, anchor_01 = sample_dataset_latents(vae, dataset_paths, batch_size, image_h, image_w, device)
                 latents, _ = generate_latents_img2img_differentiable(
                     unet, scheduler, text_embeddings, init_latents, img2img_strength,
                     num_steps, guidance, device,
@@ -613,7 +651,9 @@ def evaluate_detection(
                 )
             vae_dtype = next(vae.parameters()).dtype
             pixel_01 = (vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample.clamp(-1, 1) + 1) / 2
-            pil_imgs = latent_to_pil(vae, latents)
+            if anchor_01 is not None and epsilon > 0:
+                pixel_01 = clip_to_epsilon_ball(pixel_01, anchor_01, epsilon)
+            pil_imgs = pixels_01_to_pil(pixel_01)
 
             for name, clf in evaluators.items():
                 if name.endswith("_dct"):
@@ -795,15 +835,21 @@ def run_feedback_loop(cfg: dict):
         print(f"[IQA]  Loaded '{iqa_name}' (weight={iqa_weight}, frozen)")
 
     # --- Anti-noise regularisation ------------------------------------------
-    # tv_weight penalises blotchy pixel-to-pixel jitter directly (cheap, no
-    # extra model). recon_weight anchors the output to the real seed image
-    # in pixel space and only applies in img2img/dataset_root mode.
+    # tv_weight/recon_weight are *soft* penalties — in practice they weren't
+    # strong enough to stop the classifier gradient from blowing the face up
+    # into noise over hundreds of steps. `perturbation_epsilon` is the real
+    # fix: a hard L-infinity clip that makes it structurally impossible for
+    # the output to exceed that pixel distance from the real seed image, no
+    # matter how the classifier gradient pulls. Only applies in img2img mode.
     tv_weight    = float(cfg.get("tv_weight", 0.0))
     recon_weight = float(cfg.get("recon_weight", 0.0))
+    epsilon      = float(cfg.get("perturbation_epsilon", 0.0))
     if tv_weight > 0:
         print(f"[TV]   Total-variation loss enabled (weight={tv_weight})")
     if dataset_paths and recon_weight > 0:
         print(f"[RECON] Pixel-space anchor loss vs. real seed image enabled (weight={recon_weight})")
+    if dataset_paths and epsilon > 0:
+        print(f"[EPS]  Hard epsilon-ball clip enabled (epsilon={epsilon}, ~{epsilon*255:.0f}/255)")
 
     # --- Optional anti-drift distillation to a frozen reference UNet -------
     # Deepcopy the current UNet BEFORE any training so the reference captures
@@ -824,6 +870,7 @@ def run_feedback_loop(cfg: dict):
         unet, vae, pipe.scheduler, text_encoder, tokenizer,
         evaluators, cfg, device, eval_iterations, log_scale,
         label="PRE-TRAINING", dataset_paths=dataset_paths, img2img_strength=img2img_strength,
+        epsilon=epsilon,
     )
     print_eval_report(pre_results, "Pre-Training")
 
@@ -882,6 +929,7 @@ def run_feedback_loop(cfg: dict):
             log_scale=log_scale, device=device,
             iqa_metric=iqa_metric, iqa_weight=iqa_weight,
             tv_weight=tv_weight, anchor_pixels_01=anchor_01, recon_weight=recon_weight,
+            epsilon=epsilon,
         )
         if distill_loss is not None:
             loss = loss + distill_weight * distill_loss
@@ -902,7 +950,7 @@ def run_feedback_loop(cfg: dict):
         print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}{tv_str}{recon_str}{distill_str}")
 
         if step % save_images_every == 0:
-            pil_imgs = latent_to_pil(vae, latents.detach())
+            pil_imgs = latent_to_pil(vae, latents.detach(), anchor_01=anchor_01, epsilon=epsilon)
             for i, img in enumerate(pil_imgs):
                 img.save(output_dir / f"step{step:04d}_img{i}.png")
             print(f"    Saved {len(pil_imgs)} sample image(s) to {output_dir}/")
@@ -926,6 +974,7 @@ def run_feedback_loop(cfg: dict):
         unet, vae, pipe.scheduler, text_encoder, tokenizer,
         evaluators, cfg, device, eval_iterations, log_scale,
         label="POST-TRAINING", dataset_paths=dataset_paths, img2img_strength=img2img_strength,
+        epsilon=epsilon,
     )
     print_eval_report(post_results, "Post-Training")
     print_comparison(pre_results, post_results)
