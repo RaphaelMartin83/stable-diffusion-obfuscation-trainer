@@ -16,9 +16,11 @@ sd_model_id: "runwayml/stable-diffusion-v1-5"
 # visually close to real content and avoids the broadband high-frequency
 # "noise" the adversarial loss tends to inject when generating from scratch.
 # Point this at a folder of real deepfake images (recursively searched),
-# e.g. the challenge test set: ../test_set_deepfake/Dataset/test/fake
+# e.g. the challenge test set: test_set_deepfake/Dataset/test/fake
+# NOTE: like `models_dir` below, this path is resolved relative to the
+# working directory the script is *run from* (not this file's location).
 # Leave unset / comment out to fall back to pure txt2img-from-noise.
-dataset_root: ../test_set_deepfake/Dataset/test/fake
+dataset_root: test_set_deepfake/Dataset/test/fake
 
 # Fraction of the DDIM trajectory to re-noise/re-run (0, 1]. Lower = output
 # stays closer to the original real image; higher = more freedom to change
