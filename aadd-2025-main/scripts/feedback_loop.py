@@ -247,8 +247,13 @@ def load_image_tensor(path: Path, height: int, width: int, device: torch.device)
 
 def sample_dataset_latents(
     vae, dataset_paths: list[Path], batch_size: int, height: int, width: int, device: torch.device,
-) -> torch.Tensor:
-    """Sample a batch of real images from the dataset and encode them to VAE latents (frozen, no grad)."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a batch of real images, encode to VAE latents (frozen, no grad).
+
+    Returns ``(latents, anchor_pixels_01)`` where ``anchor_pixels_01`` is the
+    real image in [0, 1], usable as a reconstruction target to keep the
+    generated output visually close to it.
+    """
     paths = (
         random.sample(dataset_paths, batch_size)
         if batch_size <= len(dataset_paths)
@@ -258,7 +263,8 @@ def sample_dataset_latents(
     vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
         latents = vae.encode(pixel_tensors.to(vae_dtype)).latent_dist.sample()
-    return latents * vae.config.scaling_factor
+    anchor_pixels_01 = (pixel_tensors.clamp(-1, 1) + 1) / 2
+    return latents * vae.config.scaling_factor, anchor_pixels_01
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +398,17 @@ def generate_latents_img2img_differentiable(
 # Loss: classifiers must predict "real" for generated images
 # ---------------------------------------------------------------------------
 
+def total_variation_loss(x: torch.Tensor) -> torch.Tensor:
+    """Mean absolute pixel-to-pixel difference — directly penalises the
+    blotchy, high-frequency noise the adversarial classifier loss tends to
+    inject (it's the cheapest way to flip a classifier's prediction, so
+    without a counter-pressure it wins over image quality).
+    """
+    dh = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
+    dw = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+    return dh + dw
+
+
 def classifier_evasion_loss(
     vae,
     latents: torch.Tensor,
@@ -400,6 +417,9 @@ def classifier_evasion_loss(
     device: torch.device,
     iqa_metric=None,
     iqa_weight: float = 0.0,
+    tv_weight: float = 0.0,
+    anchor_pixels_01: torch.Tensor | None = None,
+    recon_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """
     Decode latents → PIL images, run every classifier, return combined loss.
@@ -471,11 +491,27 @@ def classifier_evasion_loss(
         }
 
     detector_loss = total_loss / len(classifiers)
+    extra_loss = torch.tensor(0.0, device=device)
+
     if iqa_metric is not None and iqa_weight > 0:
         iqa_loss = iqa_metric(pixel_01.float())
         per_clf_info["_iqa"] = {"loss": iqa_loss.item(), "weight": iqa_weight}
-        return detector_loss + iqa_weight * iqa_loss, per_clf_info
-    return detector_loss, per_clf_info
+        extra_loss = extra_loss + iqa_weight * iqa_loss
+
+    if tv_weight > 0:
+        tv_loss = total_variation_loss(pixel_01)
+        per_clf_info["_tv"] = {"loss": tv_loss.item(), "weight": tv_weight}
+        extra_loss = extra_loss + tv_weight * tv_loss
+
+    if anchor_pixels_01 is not None and recon_weight > 0:
+        # Anchors the output to the real seed image in pixel space — the
+        # most direct counter-pressure against localised noise, since any
+        # blotchy perturbation directly increases this loss.
+        recon_loss = F.l1_loss(pixel_01, anchor_pixels_01)
+        per_clf_info["_recon"] = {"loss": recon_loss.item(), "weight": recon_weight}
+        extra_loss = extra_loss + recon_weight * recon_loss
+
+    return detector_loss + extra_loss, per_clf_info
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +601,7 @@ def evaluate_detection(
 
         for i in trange(n_iters, desc=f"Eval{tag}"):
             if dataset_paths:
-                init_latents = sample_dataset_latents(vae, dataset_paths, batch_size, image_h, image_w, device)
+                init_latents, _ = sample_dataset_latents(vae, dataset_paths, batch_size, image_h, image_w, device)
                 latents, _ = generate_latents_img2img_differentiable(
                     unet, scheduler, text_embeddings, init_latents, img2img_strength,
                     num_steps, guidance, device,
@@ -758,6 +794,17 @@ def run_feedback_loop(cfg: dict):
         iqa_metric = load_iqa_metric(iqa_name, device)
         print(f"[IQA]  Loaded '{iqa_name}' (weight={iqa_weight}, frozen)")
 
+    # --- Anti-noise regularisation ------------------------------------------
+    # tv_weight penalises blotchy pixel-to-pixel jitter directly (cheap, no
+    # extra model). recon_weight anchors the output to the real seed image
+    # in pixel space and only applies in img2img/dataset_root mode.
+    tv_weight    = float(cfg.get("tv_weight", 0.0))
+    recon_weight = float(cfg.get("recon_weight", 0.0))
+    if tv_weight > 0:
+        print(f"[TV]   Total-variation loss enabled (weight={tv_weight})")
+    if dataset_paths and recon_weight > 0:
+        print(f"[RECON] Pixel-space anchor loss vs. real seed image enabled (weight={recon_weight})")
+
     # --- Optional anti-drift distillation to a frozen reference UNet -------
     # Deepcopy the current UNet BEFORE any training so the reference captures
     # the original SD prior. Only the trainable UNet's noise prediction gets
@@ -810,8 +857,9 @@ def run_feedback_loop(cfg: dict):
     for step in trange(1, total_iterations + 1, desc="Feedback loop"):
         optimizer.zero_grad()
 
+        anchor_01 = None
         if dataset_paths:
-            init_latents = sample_dataset_latents(
+            init_latents, anchor_01 = sample_dataset_latents(
                 vae, dataset_paths, batch_size,
                 int(cfg.get("image_height", 512)), int(cfg.get("image_width", 512)), device,
             )
@@ -833,6 +881,7 @@ def run_feedback_loop(cfg: dict):
             vae=vae, latents=latents, classifiers=classifiers,
             log_scale=log_scale, device=device,
             iqa_metric=iqa_metric, iqa_weight=iqa_weight,
+            tv_weight=tv_weight, anchor_pixels_01=anchor_01, recon_weight=recon_weight,
         )
         if distill_loss is not None:
             loss = loss + distill_weight * distill_loss
@@ -847,8 +896,10 @@ def run_feedback_loop(cfg: dict):
             for n, v in clf_info.items() if not n.startswith("_")
         )
         iqa_str = f"  iqa={clf_info['_iqa']['loss']:.3f}" if "_iqa" in clf_info else ""
+        tv_str = f"  tv={clf_info['_tv']['loss']:.4f}" if "_tv" in clf_info else ""
+        recon_str = f"  recon={clf_info['_recon']['loss']:.4f}" if "_recon" in clf_info else ""
         distill_str = f"  distill={clf_info['_distill']['loss']:.4f}" if "_distill" in clf_info else ""
-        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}{distill_str}")
+        print(f"\n[Step {step:04d}] loss={loss.item():.4f}  {asr_summary}{iqa_str}{tv_str}{recon_str}{distill_str}")
 
         if step % save_images_every == 0:
             pil_imgs = latent_to_pil(vae, latents.detach())

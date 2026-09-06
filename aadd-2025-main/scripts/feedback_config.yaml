@@ -63,8 +63,24 @@ grad_clip: 1.0                  # gradient norm clipping
 
 # images don't just fool detectors but also look natural to a human.
 # Set iqa_weight to 0 (or omit the block) to disable — no metric is loaded.
+# NOTE: on a 500-step run, iqa_weight=0.3 was NOT enough to hold back the
+# adversarial loss from injecting blotchy high-frequency noise into the
+# face — IQA loss got worse over training, not better. Raised to 0.6; also
+# see tv_weight/recon_weight below, which attack the same failure mode
+# more directly.
 iqa_metric: clipiqa             # pyiqa metric name (clipiqa | musiq | maniqa | ...)
-iqa_weight: 0.3                 # relative weight vs. detector loss (both roughly [0,1])
+iqa_weight: 0.6                 # relative weight vs. detector loss (both roughly [0,1])
+
+# Total-variation loss: penalises pixel-to-pixel jitter directly (cheap, no
+# extra model needed). This is the most direct counter to the "blotchy
+# noise concentrated on the face" artifact, since that IS high local jitter.
+tv_weight: 0.15
+
+# Reconstruction anchor: L1 distance (pixel space) between the generated
+# output and the real seed image. Only active when `dataset_root` is set
+# (img2img mode) — pins the output to look like the real photo, which is
+# also literally the challenge's "preserve visual similarity" requirement.
+recon_weight: 1.0
 
 # --- Anti-drift distillation to a frozen reference UNet ---------------
 # Keeps the trainable UNet's noise prediction close to the original SD
