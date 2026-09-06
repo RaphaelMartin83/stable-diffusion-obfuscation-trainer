@@ -10,6 +10,21 @@
 #   "/path/to/local/sd-model"
 sd_model_id: "runwayml/stable-diffusion-v1-5"
 
+# --- Dataset seeding (img2img mode) ------------------------------------
+# When set, every generation is seeded from a real fake image (partially
+# noised, SDEdit-style) instead of pure Gaussian noise. This keeps outputs
+# visually close to real content and avoids the broadband high-frequency
+# "noise" the adversarial loss tends to inject when generating from scratch.
+# Point this at a folder of real deepfake images (recursively searched),
+# e.g. the challenge test set: ../test_set_deepfake/Dataset/test/fake
+# Leave unset / comment out to fall back to pure txt2img-from-noise.
+dataset_root: ../test_set_deepfake/Dataset/test/fake
+
+# Fraction of the DDIM trajectory to re-noise/re-run (0, 1]. Lower = output
+# stays closer to the original real image; higher = more freedom to change
+# it (closer to full txt2img). Start around 0.3–0.4.
+img2img_strength: 0.35
+
 # --- Classifiers (same names as evaluate.py) --------------------------
 models_dir: ../models/.models
 
@@ -18,6 +33,7 @@ classifiers:
   - resnet50
   - densenet121
   - cavia2024
+  - densenet121_dct
 
 # evaluator models are used only for measurement — no gradient, just counting detections
 # defaults to 'classifiers' if omitted
@@ -25,7 +41,6 @@ evaluator:
   - resnet50
   - densenet121
   - vit_b_16
-  - densenet121_dct
   - cavia2024
 
 # number of images generated for each evaluation pass (pre- and post-training)

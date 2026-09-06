@@ -5,9 +5,16 @@ Overview
 --------
 Each iteration of the loop:
 
-1. **Generate** a batch of images from the SD UNet via a full forward diffusion
-   + DDIM-inversion-free decode (we keep the latent graph alive with
-   `requires_grad=True` on the initial noise so gradients can flow back).
+1. **Generate** a batch of images from the SD UNet. Two seeding modes:
+   * txt2img (default when `dataset_root` is unset): full forward diffusion
+     from pure Gaussian noise.
+   * img2img (when `dataset_root` is set): a real image from the dataset is
+     VAE-encoded and partially re-noised per `img2img_strength`, then only
+     the remaining DDIM steps are run. This keeps output visually close to
+     real content and avoids the broadband high-frequency "noise" the
+     adversarial loss tends to inject when generating from scratch.
+   In both modes we keep the latent graph alive on the final denoising step
+   so gradients can flow back into the UNet.
 2. **Classify** each generated image with all loaded classifiers.
 3. **Compute loss**: we want classifiers to predict "real" (class 0), so we
    minimise cross-entropy against label 0.  The combined loss is the mean
@@ -38,6 +45,7 @@ Requirements (in addition to evaluate.py deps)
 
 import argparse
 import json
+import random
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -218,6 +226,42 @@ def latent_to_pil(vae, latents: torch.Tensor) -> list[Image.Image]:
 
 
 # ---------------------------------------------------------------------------
+# Dataset loading for img2img seeding (adversarial perturbation of real fakes)
+# ---------------------------------------------------------------------------
+
+def list_dataset_images(root: Path) -> list[Path]:
+    """Recursively collect image file paths under root."""
+    paths = [p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
+    if not paths:
+        raise FileNotFoundError(f"No images found under dataset_root: {root}")
+    return paths
+
+
+def load_image_tensor(path: Path, height: int, width: int, device: torch.device) -> torch.Tensor:
+    """Load an image as a 1x3xHxW tensor in [-1, 1] (VAE encoder input range)."""
+    img = Image.open(path).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    return (tensor * 2 - 1).to(device)
+
+
+def sample_dataset_latents(
+    vae, dataset_paths: list[Path], batch_size: int, height: int, width: int, device: torch.device,
+) -> torch.Tensor:
+    """Sample a batch of real images from the dataset and encode them to VAE latents (frozen, no grad)."""
+    paths = (
+        random.sample(dataset_paths, batch_size)
+        if batch_size <= len(dataset_paths)
+        else random.choices(dataset_paths, k=batch_size)
+    )
+    pixel_tensors = torch.cat([load_image_tensor(p, height, width, device) for p in paths], dim=0)
+    vae_dtype = next(vae.parameters()).dtype
+    with torch.no_grad():
+        latents = vae.encode(pixel_tensors.to(vae_dtype)).latent_dist.sample()
+    return latents * vae.config.scaling_factor
+
+
+# ---------------------------------------------------------------------------
 # Differentiable generation step
 # ---------------------------------------------------------------------------
 
@@ -263,6 +307,69 @@ def generate_latents_differentiable(
             latents = scheduler.step(noise_pred, t, latents).prev_sample
 
     # Final step WITH gradients
+    t = timesteps[-1]
+    latent_input = torch.cat([latents] * 2)
+    latent_input = scheduler.scale_model_input(latent_input, t)
+    noise_pred = unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+
+    distill_loss: torch.Tensor | None = None
+    if ref_unet is not None:
+        with torch.no_grad():
+            ref_noise_pred = ref_unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+        distill_loss = F.mse_loss(noise_pred, ref_noise_pred.detach())
+
+    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+    latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+    return latents, distill_loss
+
+
+def generate_latents_img2img_differentiable(
+    unet,
+    scheduler,
+    text_embeddings: torch.Tensor,
+    init_latents: torch.Tensor,
+    strength: float,
+    num_inference_steps: int,
+    guidance_scale: float,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+    ref_unet: nn.Module | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    SDEdit-style img2img: partially noise a real image's latents and run only
+    the remaining DDIM steps, keeping gradients alive on the final step only.
+
+    ``strength`` in (0, 1] controls how much of the original structure is
+    kept — low strength keeps the output close to ``init_latents`` (i.e. the
+    real input image), which is what curbs the broadband high-frequency
+    "noise" artifacts that pure-noise txt2img generation tends to introduce
+    once the UNet is adversarially fine-tuned.
+    """
+    scheduler.set_timesteps(num_inference_steps)
+    all_timesteps = scheduler.timesteps
+
+    init_step = max(1, min(int(round(num_inference_steps * strength)), num_inference_steps))
+    t_start = num_inference_steps - init_step
+    timesteps = all_timesteps[t_start:]
+
+    unet_dtype = next(unet.parameters()).dtype
+    init_latents = init_latents.to(dtype=unet_dtype)
+    noise = torch.randn(init_latents.shape, generator=generator, device=device, dtype=unet_dtype)
+    start_t = timesteps[:1].repeat(init_latents.shape[0])
+    latents = scheduler.add_noise(init_latents, noise, start_t)
+    text_embeddings = text_embeddings.to(dtype=unet_dtype)
+
+    with torch.no_grad():
+        for t in timesteps[:-1]:
+            latent_input = torch.cat([latents] * 2)
+            latent_input = scheduler.scale_model_input(latent_input, t)
+            noise_pred = unet(latent_input, t, encoder_hidden_states=text_embeddings).sample
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            latents = scheduler.step(noise_pred, t, latents).prev_sample
+
     t = timesteps[-1]
     latent_input = torch.cat([latents] * 2)
     latent_input = scheduler.scale_model_input(latent_input, t)
@@ -415,11 +522,16 @@ def evaluate_detection(
     n_iters: int,
     log_scale: bool,
     label: str = "",
+    dataset_paths: list[Path] | None = None,
+    img2img_strength: float = 0.35,
 ) -> dict:
     """
     Generate n_iters images with the current UNet and count how many each
     evaluator classifies as fake (class 1) vs. real (class 0).
     Returns per-evaluator stats and an aggregate.
+
+    If ``dataset_paths`` is given, each image is seeded from a real sample
+    via img2img (SDEdit-style partial noising) instead of pure noise.
     """
     unet.eval()
     prompt: str = cfg.get("prompt", "a photo of a person")
@@ -427,8 +539,10 @@ def evaluate_detection(
     batch_size: int = int(cfg.get("batch_size", 1))
     num_steps: int = int(cfg.get("num_inference_steps", 20))
     guidance: float = float(cfg.get("guidance_scale", 7.5))
-    latent_h = int(cfg.get("image_height", 512)) // 8
-    latent_w = int(cfg.get("image_width", 512)) // 8
+    image_h = int(cfg.get("image_height", 512))
+    image_w = int(cfg.get("image_width", 512))
+    latent_h = image_h // 8
+    latent_w = image_w // 8
     latent_shape = (batch_size, unet.config.in_channels, latent_h, latent_w)
 
     tag = f" [{label}]" if label else ""
@@ -450,10 +564,17 @@ def evaluate_detection(
         text_embeddings = torch.cat([uncond_emb, text_encoder(cond_ids)[0]])
 
         for i in trange(n_iters, desc=f"Eval{tag}"):
-            latents = generate_latents_inference(
-                unet, scheduler, text_embeddings,
-                latent_shape, num_steps, guidance, device,
-            )
+            if dataset_paths:
+                init_latents = sample_dataset_latents(vae, dataset_paths, batch_size, image_h, image_w, device)
+                latents, _ = generate_latents_img2img_differentiable(
+                    unet, scheduler, text_embeddings, init_latents, img2img_strength,
+                    num_steps, guidance, device,
+                )
+            else:
+                latents = generate_latents_inference(
+                    unet, scheduler, text_embeddings,
+                    latent_shape, num_steps, guidance, device,
+                )
             vae_dtype = next(vae.parameters()).dtype
             pixel_01 = (vae.decode((latents / vae.config.scaling_factor).to(vae_dtype)).sample.clamp(-1, 1) + 1) / 2
             pil_imgs = latent_to_pil(vae, latents)
@@ -616,6 +737,19 @@ def run_feedback_loop(cfg: dict):
     output_dir           = Path(cfg.get("output_dir", "feedback_output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Dataset seeding (img2img mode) -------------------------------------
+    # When `dataset_root` is set, every generation starts from a real fake
+    # image (partially noised per `img2img_strength`) instead of pure
+    # Gaussian noise. This keeps output visually close to real content and
+    # avoids the broadband high-frequency "noise" the adversarial loss tends
+    # to inject when generating from scratch.
+    dataset_paths: list[Path] | None = None
+    img2img_strength = float(cfg.get("img2img_strength", 0.35))
+    if cfg.get("dataset_root"):
+        dataset_paths = list_dataset_images(Path(cfg["dataset_root"]))
+        print(f"[DATA] Found {len(dataset_paths)} real images under '{cfg['dataset_root']}' "
+              f"(img2img_strength={img2img_strength})")
+
     # --- Optional IQA loss --------------------------------------------------
     iqa_name   = str(cfg.get("iqa_metric", "clipiqa"))
     iqa_weight = float(cfg.get("iqa_weight", 0.0))
@@ -642,7 +776,7 @@ def run_feedback_loop(cfg: dict):
     pre_results = evaluate_detection(
         unet, vae, pipe.scheduler, text_encoder, tokenizer,
         evaluators, cfg, device, eval_iterations, log_scale,
-        label="PRE-TRAINING",
+        label="PRE-TRAINING", dataset_paths=dataset_paths, img2img_strength=img2img_strength,
     )
     print_eval_report(pre_results, "Pre-Training")
 
@@ -676,12 +810,25 @@ def run_feedback_loop(cfg: dict):
     for step in trange(1, total_iterations + 1, desc="Feedback loop"):
         optimizer.zero_grad()
 
-        latents, distill_loss = generate_latents_differentiable(
-            unet=unet, scheduler=pipe.scheduler,
-            text_embeddings=text_embeddings, latent_shape=latent_shape,
-            num_inference_steps=num_steps, guidance_scale=guidance, device=device,
-            ref_unet=ref_unet,
-        )
+        if dataset_paths:
+            init_latents = sample_dataset_latents(
+                vae, dataset_paths, batch_size,
+                int(cfg.get("image_height", 512)), int(cfg.get("image_width", 512)), device,
+            )
+            latents, distill_loss = generate_latents_img2img_differentiable(
+                unet=unet, scheduler=pipe.scheduler,
+                text_embeddings=text_embeddings, init_latents=init_latents,
+                strength=img2img_strength,
+                num_inference_steps=num_steps, guidance_scale=guidance, device=device,
+                ref_unet=ref_unet,
+            )
+        else:
+            latents, distill_loss = generate_latents_differentiable(
+                unet=unet, scheduler=pipe.scheduler,
+                text_embeddings=text_embeddings, latent_shape=latent_shape,
+                num_inference_steps=num_steps, guidance_scale=guidance, device=device,
+                ref_unet=ref_unet,
+            )
         loss, clf_info = classifier_evasion_loss(
             vae=vae, latents=latents, classifiers=classifiers,
             log_scale=log_scale, device=device,
@@ -727,7 +874,7 @@ def run_feedback_loop(cfg: dict):
     post_results = evaluate_detection(
         unet, vae, pipe.scheduler, text_encoder, tokenizer,
         evaluators, cfg, device, eval_iterations, log_scale,
-        label="POST-TRAINING",
+        label="POST-TRAINING", dataset_paths=dataset_paths, img2img_strength=img2img_strength,
     )
     print_eval_report(post_results, "Post-Training")
     print_comparison(pre_results, post_results)
